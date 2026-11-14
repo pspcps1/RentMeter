@@ -1,0 +1,6 @@
+{
+  "name": "RentLedger",
+  "description": "Offline property rental, tenant check-in/out, on-device digital & analog electricity meter OCR, PDF invoicing, expenses, and local zip backup.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
