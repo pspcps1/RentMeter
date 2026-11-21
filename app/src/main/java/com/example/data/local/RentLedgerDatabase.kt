@@ -8,12 +8,16 @@ import androidx.room.TypeConverter
 import androidx.room.TypeConverters
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.example.data.model.ElectricityBillingMode
 import com.example.data.model.ExpenseCategory
 import com.example.data.model.ExpenseSplitMode
 import com.example.data.model.InvoiceStatus
+import com.example.data.model.MaritalStatus
 import com.example.data.model.MeterType
 import com.example.data.model.PaymentMethod
 import com.example.data.model.PropertyType
+import com.example.data.model.TenantDocumentType
+import com.example.data.model.TenantGender
 import com.example.data.model.WaterRateMode
 
 class RentLedgerTypeConverters {
@@ -37,6 +41,22 @@ class RentLedgerTypeConverters {
 
     @TypeConverter fun fromExpenseSplitMode(value: ExpenseSplitMode): String = value.name
     @TypeConverter fun toExpenseSplitMode(value: String): ExpenseSplitMode = ExpenseSplitMode.valueOf(value)
+
+    @TypeConverter fun fromTenantGender(value: TenantGender): String = value.name
+    @TypeConverter fun toTenantGender(value: String): TenantGender =
+        runCatching { TenantGender.valueOf(value) }.getOrDefault(TenantGender.UNSPECIFIED)
+
+    @TypeConverter fun fromMaritalStatus(value: MaritalStatus): String = value.name
+    @TypeConverter fun toMaritalStatus(value: String): MaritalStatus =
+        runCatching { MaritalStatus.valueOf(value) }.getOrDefault(MaritalStatus.UNSPECIFIED)
+
+    @TypeConverter fun fromTenantDocumentType(value: TenantDocumentType): String = value.name
+    @TypeConverter fun toTenantDocumentType(value: String): TenantDocumentType =
+        runCatching { TenantDocumentType.valueOf(value) }.getOrDefault(TenantDocumentType.OTHER)
+
+    @TypeConverter fun fromElectricityBillingMode(value: ElectricityBillingMode): String = value.name
+    @TypeConverter fun toElectricityBillingMode(value: String): ElectricityBillingMode =
+        runCatching { ElectricityBillingMode.valueOf(value) }.getOrDefault(ElectricityBillingMode.INHERIT)
 }
 
 @Database(
@@ -44,13 +64,14 @@ class RentLedgerTypeConverters {
         PropertyEntity::class,
         UnitEntity::class,
         LeaseEntity::class,
+        TenantDocumentEntity::class,
         MeterReadingEntity::class,
         InvoiceEntity::class,
         PaymentEntity::class,
         ExpenseEntity::class,
         SharedChargeEntity::class
     ],
-    version = 3,
+    version = 5,
     exportSchema = false
 )
 @TypeConverters(RentLedgerTypeConverters::class)
@@ -58,6 +79,7 @@ abstract class RentLedgerDatabase : RoomDatabase() {
     abstract fun propertyDao(): PropertyDao
     abstract fun unitDao(): UnitDao
     abstract fun leaseDao(): LeaseDao
+    abstract fun tenantDocumentDao(): TenantDocumentDao
     abstract fun meterReadingDao(): MeterReadingDao
     abstract fun invoiceDao(): InvoiceDao
     abstract fun paymentDao(): PaymentDao
@@ -124,6 +146,42 @@ abstract class RentLedgerDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE leases ADD COLUMN gender TEXT NOT NULL DEFAULT 'UNSPECIFIED'")
+                db.execSQL("ALTER TABLE leases ADD COLUMN maritalStatus TEXT NOT NULL DEFAULT 'UNSPECIFIED'")
+                db.execSQL("ALTER TABLE leases ADD COLUMN profilePhotoPath TEXT")
+                db.execSQL("ALTER TABLE leases ADD COLUMN childCountBelow5 INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE leases ADD COLUMN childNotes TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE expenses ADD COLUMN unitId INTEGER")
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `tenant_documents` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `leaseId` INTEGER NOT NULL,
+                        `title` TEXT NOT NULL,
+                        `docType` TEXT NOT NULL,
+                        `filePath` TEXT NOT NULL,
+                        `mimeType` TEXT NOT NULL,
+                        `addedAt` INTEGER NOT NULL,
+                        FOREIGN KEY(`leaseId`) REFERENCES `leases`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_tenant_documents_leaseId` ON `tenant_documents` (`leaseId`)")
+            }
+        }
+
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE properties ADD COLUMN electricityBillingMode TEXT NOT NULL DEFAULT 'INHERIT'")
+                db.execSQL("ALTER TABLE units ADD COLUMN electricityBillingMode TEXT NOT NULL DEFAULT 'INHERIT'")
+                db.execSQL("ALTER TABLE leases ADD COLUMN defaultMaintenanceCharge REAL NOT NULL DEFAULT 0.0")
+                db.execSQL("ALTER TABLE leases ADD COLUMN defaultOtherCharge REAL NOT NULL DEFAULT 0.0")
+                db.execSQL("ALTER TABLE leases ADD COLUMN defaultOtherChargeLabel TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
         @Volatile
         private var INSTANCE: RentLedgerDatabase? = null
 
@@ -134,7 +192,7 @@ abstract class RentLedgerDatabase : RoomDatabase() {
                     RentLedgerDatabase::class.java,
                     "rentledger.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     .fallbackToDestructiveMigration(true)
                     .build()
                     .also { INSTANCE = it }

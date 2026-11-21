@@ -9,13 +9,18 @@ import com.example.data.local.PaymentEntity
 import com.example.data.local.PropertyEntity
 import com.example.data.local.RentLedgerDatabase
 import com.example.data.local.SharedChargeEntity
+import com.example.data.local.TenantDocumentEntity
 import com.example.data.local.UnitEntity
+import com.example.data.model.ElectricityBillingMode
 import com.example.data.model.ExpenseCategory
 import com.example.data.model.ExpenseSplitMode
 import com.example.data.model.InvoiceStatus
+import com.example.data.model.MaritalStatus
 import com.example.data.model.MeterType
 import com.example.data.model.PaymentMethod
 import com.example.data.model.PropertyType
+import com.example.data.model.TenantDocumentType
+import com.example.data.model.TenantGender
 import com.example.data.model.WaterRateMode
 import com.example.data.preferences.OwnerSettings
 import com.example.data.preferences.SettingsDataStore
@@ -45,6 +50,12 @@ data class AutoTask(
 )
 
 data class ResolvedRate(
+    val rate: Double,
+    val sourceLabel: String
+)
+
+data class ResolvedElectricityConfig(
+    val mode: ElectricityBillingMode,
     val rate: Double,
     val sourceLabel: String
 )
@@ -82,6 +93,7 @@ data class UnitWithContext(
     val activeLease: LeaseEntity?,
     val latestInvoice: InvoiceEntity?,
     val unpaidBalance: Double,
+    val electricityBillingMode: ElectricityBillingMode = ElectricityBillingMode.METERED,
     val effectiveElectricityRate: Double = unit.electricityRateOverride ?: property.electricityRateOverride ?: 8.0,
     val electricityRateSource: String = "Common default",
     val resolvedWater: ResolvedWaterConfig = ResolvedWaterConfig(
@@ -119,6 +131,7 @@ class RentLedgerRepository(
     private val propertyDao = db.propertyDao()
     private val unitDao = db.unitDao()
     private val leaseDao = db.leaseDao()
+    private val tenantDocumentDao = db.tenantDocumentDao()
     private val meterReadingDao = db.meterReadingDao()
     private val invoiceDao = db.invoiceDao()
     private val paymentDao = db.paymentDao()
@@ -128,6 +141,7 @@ class RentLedgerRepository(
     val propertiesFlow: Flow<List<PropertyEntity>> = propertyDao.observeAll()
     val unitsFlow: Flow<List<UnitEntity>> = unitDao.observeAll()
     val leasesFlow: Flow<List<LeaseEntity>> = leaseDao.observeAll()
+    val tenantDocumentsFlow: Flow<List<TenantDocumentEntity>> = tenantDocumentDao.observeAll()
     val meterReadingsFlow: Flow<List<MeterReadingEntity>> = meterReadingDao.observeAll()
     val invoicesFlow: Flow<List<InvoiceEntity>> = invoiceDao.observeAll()
     val paymentsFlow: Flow<List<PaymentEntity>> = paymentDao.observeAll()
@@ -159,7 +173,7 @@ class RentLedgerRepository(
                 .filter { it.status != InvoiceStatus.PAID }
                 .sumOf { max(0.0, it.totalAmount - it.paidAmount) }
 
-            val resolvedElec = resolveElectricityRate(unit, prop, settings)
+            val resolvedElec = resolveElectricityConfig(unit, prop, settings)
             val occupants = (lease?.occupantCount ?: 1).coerceAtLeast(1)
             val resolvedWater = resolveWaterConfig(unit, prop, occupants, settings)
             val resolvedDeposit = resolveDefaultDeposit(unit, prop, settings)
@@ -173,6 +187,7 @@ class RentLedgerRepository(
                 activeLease = lease,
                 latestInvoice = latestInvoice,
                 unpaidBalance = unpaid,
+                electricityBillingMode = resolvedElec.mode,
                 effectiveElectricityRate = resolvedElec.rate,
                 electricityRateSource = resolvedElec.sourceLabel,
                 resolvedWater = resolvedWater,
@@ -188,8 +203,9 @@ class RentLedgerRepository(
         observeUnitsWithContext(),
         invoicesFlow,
         expensesFlow,
-        meterReadingsFlow
-    ) { unitsWithCtx, invoices, expenses, readings ->
+        meterReadingsFlow,
+        settingsFlow
+    ) { unitsWithCtx, invoices, expenses, readings, settings ->
         val monthInvoices = invoices.filter { it.billingMonth == month }
         val monthExpenses = expenses.filter { it.billingMonth == month }
 
@@ -201,7 +217,11 @@ class RentLedgerRepository(
         val billedUnitIdsThisMonth = monthInvoices.map { it.unitId }.toSet()
         val unbilledBaseExpected = unitsWithCtx
             .filter { it.activeLease != null && it.unit.id !in billedUnitIdsThisMonth }
-            .sumOf { it.unit.baseRent + it.resolvedWater.computedCharge + it.pendingSharedTotal }
+            .sumOf {
+                val leaseExtras = (it.activeLease?.defaultMaintenanceCharge ?: 0.0) +
+                    (it.activeLease?.defaultOtherCharge ?: 0.0)
+                it.unit.baseRent + it.resolvedWater.computedCharge + leaseExtras + it.pendingSharedTotal
+            }
 
         val billedTotal = monthInvoices.sumOf { it.totalAmount }
         val collected = monthInvoices.sumOf { it.paidAmount }
@@ -217,7 +237,10 @@ class RentLedgerRepository(
             .map { it.unitId }
             .toSet()
 
-        val todayDay = Calendar.getInstance().get(Calendar.DAY_OF_MONTH)
+        val cal = Calendar.getInstance()
+        val todayDay = cal.get(Calendar.DAY_OF_MONTH)
+        val billingGenDay = SettingsDataStore.resolveBillingDayForMonth(settings.rentGenerationDay, cal)
+        val genCountdown = billingGenDay - todayDay
         val tasks = mutableListOf<AutoTask>()
 
         unitsWithCtx.forEach { ctx ->
@@ -225,12 +248,14 @@ class RentLedgerRepository(
             val propName = ctx.property.name
             val unitLabel = "${ctx.unit.unitName} ($propName)"
 
-            if (ctx.unit.id !in readUnitIdsThisMonth) {
+            if (ctx.electricityBillingMode == ElectricityBillingMode.METERED && ctx.unit.id !in readUnitIdsThisMonth) {
                 val daysUntilDue = lease.rentDueDay - todayDay
-                if (daysUntilDue <= 3) {
+                if (daysUntilDue <= 3 || genCountdown <= 2) {
                     val timing = when {
+                        genCountdown == 0 -> "Bill generation day"
                         daysUntilDue < 0 -> "Overdue by ${-daysUntilDue}d"
                         daysUntilDue == 0 -> "Due today"
+                        genCountdown in 1..2 -> "Gen in ${genCountdown}d"
                         else -> "Due in ${daysUntilDue}d"
                     }
                     tasks += AutoTask(
@@ -239,7 +264,7 @@ class RentLedgerRepository(
                         title = "Scan ${ctx.unit.unitName} meter",
                         subtitle = "$propName • ${lease.tenantName} • $timing",
                         unitId = ctx.unit.id,
-                        isUrgent = daysUntilDue <= 0
+                        isUrgent = daysUntilDue <= 0 || genCountdown <= 0
                     )
                 }
             }
@@ -260,12 +285,12 @@ class RentLedgerRepository(
                         isUrgent = true
                     )
                 }
-            } else if (todayDay >= lease.rentDueDay && ctx.unit.id !in billedUnitIdsThisMonth) {
+            } else if ((todayDay >= lease.rentDueDay || genCountdown <= 1) && ctx.unit.id !in billedUnitIdsThisMonth) {
                 tasks += AutoTask(
                     id = "bill_${ctx.unit.id}",
                     kind = TaskKind.COLLECT_RENT,
                     title = "Generate rent bill for $unitLabel",
-                    subtitle = "${lease.tenantName} • Base ₹${ctx.unit.baseRent.roundToInt()} (Due ${lease.rentDueDay}th)",
+                    subtitle = "${lease.tenantName} • Fill rent, water & maint (${SettingsDataStore.formatGenerationDayLabel(settings.rentGenerationDay)})",
                     unitId = ctx.unit.id,
                     isUrgent = true
                 )
@@ -306,6 +331,13 @@ class RentLedgerRepository(
             unit.id
         }
 
+    suspend fun saveUnitsBulk(units: List<UnitEntity>) {
+        if (units.isEmpty()) return
+        db.withTransaction {
+            unitDao.insertAll(units)
+        }
+    }
+
     suspend fun deleteUnit(unit: UnitEntity) = unitDao.delete(unit)
 
     suspend fun getUnitById(unitId: Long): UnitEntity? = unitDao.getById(unitId)
@@ -314,13 +346,40 @@ class RentLedgerRepository(
 
     suspend fun getActiveLeaseForUnit(unitId: Long): LeaseEntity? = leaseDao.getActiveLeaseForUnit(unitId)
 
+    fun observeLeaseById(leaseId: Long): Flow<LeaseEntity?> = leaseDao.observeById(leaseId)
+
+    fun observeTenantDocuments(leaseId: Long): Flow<List<TenantDocumentEntity>> =
+        tenantDocumentDao.observeByLease(leaseId)
+
+    suspend fun updateLeaseProfile(lease: LeaseEntity) {
+        leaseDao.update(lease)
+    }
+
     suspend fun updateLeaseOccupantCount(leaseId: Long, occupantCount: Int) {
         leaseDao.updateOccupantCount(leaseId, occupantCount.coerceIn(1, 50))
+    }
+
+    suspend fun updateLeaseHousehold(
+        leaseId: Long,
+        occupantCount: Int,
+        childCountBelow5: Int,
+        childNotes: String
+    ) {
+        leaseDao.updateHouseholdCounts(
+            leaseId = leaseId,
+            occupantCount = occupantCount.coerceIn(1, 50),
+            childCountBelow5 = childCountBelow5.coerceIn(0, 20),
+            childNotes = childNotes.trim()
+        )
     }
 
     suspend fun updateLeaseSecurityDeposit(leaseId: Long, securityDeposit: Double) {
         leaseDao.updateSecurityDeposit(leaseId, securityDeposit.coerceAtLeast(0.0))
     }
+
+    suspend fun addTenantDocument(doc: TenantDocumentEntity): Long = tenantDocumentDao.insert(doc)
+
+    suspend fun deleteTenantDocument(doc: TenantDocumentEntity) = tenantDocumentDao.delete(doc)
 
     suspend fun getDefaultDepositForUnit(unitId: Long): ResolvedRate {
         val settings = settingsStore.getOnce()
@@ -340,6 +399,13 @@ class RentLedgerRepository(
         val property = propertyDao.getById(unit.propertyId)
         val settings = settingsStore.getOnce()
         return resolveElectricityRate(unit, property, settings)
+    }
+
+    suspend fun getEffectiveElectricityConfigForUnit(unitId: Long): ResolvedElectricityConfig {
+        val unit = unitDao.getById(unitId)
+        val property = unit?.let { propertyDao.getById(it.propertyId) }
+        val settings = settingsStore.getOnce()
+        return resolveElectricityConfig(unit, property, settings)
     }
 
     suspend fun getResolvedWaterForUnit(unitId: Long, occupantCount: Int): ResolvedWaterConfig {
@@ -366,7 +432,16 @@ class RentLedgerRepository(
         rentDueDay: Int,
         occupantCount: Int = 1,
         initialReading: Double,
-        initialPhotoPath: String?
+        initialPhotoPath: String?,
+        gender: TenantGender = TenantGender.UNSPECIFIED,
+        maritalStatus: MaritalStatus = MaritalStatus.UNSPECIFIED,
+        profilePhotoPath: String? = null,
+        childCountBelow5: Int = 0,
+        childNotes: String = "",
+        extraDocuments: List<PendingTenantDocument> = emptyList(),
+        defaultMaintenanceCharge: Double = 0.0,
+        defaultOtherCharge: Double = 0.0,
+        defaultOtherChargeLabel: String = ""
     ): Long = db.withTransaction {
         val unit = unitDao.getById(unitId) ?: throw IllegalStateException("Unit not found")
         leaseDao.getActiveLeaseForUnit(unitId)?.let { old ->
@@ -378,17 +453,38 @@ class RentLedgerRepository(
             propertyId = unit.propertyId,
             tenantName = tenantName.trim(),
             tenantPhone = tenantPhone.trim(),
+            gender = gender,
+            maritalStatus = maritalStatus,
+            profilePhotoPath = profilePhotoPath,
             tenantIdType = idType.trim(),
             tenantIdNumber = idNumber.trim(),
             idPhotoPath = idPhotoPath,
             securityDeposit = securityDeposit,
+            defaultMaintenanceCharge = defaultMaintenanceCharge.coerceAtLeast(0.0),
+            defaultOtherCharge = defaultOtherCharge.coerceAtLeast(0.0),
+            defaultOtherChargeLabel = defaultOtherChargeLabel.trim(),
             rentDueDay = rentDueDay.coerceIn(1, 28),
             occupantCount = occupantCount.coerceIn(1, 50),
+            childCountBelow5 = childCountBelow5.coerceIn(0, 20),
+            childNotes = childNotes.trim(),
             initialReading = initialReading,
             initialPhotoPath = initialPhotoPath,
             isActive = true
         )
         val leaseId = leaseDao.insert(lease)
+        if (extraDocuments.isNotEmpty()) {
+            tenantDocumentDao.insertAll(
+                extraDocuments.map { doc ->
+                    TenantDocumentEntity(
+                        leaseId = leaseId,
+                        title = doc.title.trim().ifBlank { doc.docType.label },
+                        docType = doc.docType,
+                        filePath = doc.filePath,
+                        mimeType = doc.mimeType
+                    )
+                }
+            )
+        }
         unitDao.update(
             unit.copy(
                 lastReading = initialReading,
@@ -418,10 +514,12 @@ class RentLedgerRepository(
             val lease = leaseDao.getActiveLeaseForUnit(unitId)
                 ?: throw IllegalStateException("No active tenant checked into this unit")
 
-            val effectiveRate = resolveElectricityRate(unit, property, settings).rate
+            val elecCfg = resolveElectricityConfig(unit, property, settings)
+            val effectiveRate = elecCfg.rate
             val previousReading = unit.lastReading
-            val unitsConsumed = max(0.0, currentReading - previousReading)
-            val electricityCharge = round2(unitsConsumed * effectiveRate)
+            val isMetered = elecCfg.mode == ElectricityBillingMode.METERED
+            val unitsConsumed = if (isMetered) max(0.0, currentReading - previousReading) else 0.0
+            val electricityCharge = if (isMetered) round2(unitsConsumed * effectiveRate) else 0.0
             val previousDue = if (includePreviousDue) invoiceDao.getOutstandingBalanceForLease(lease.id) else 0.0
 
             val unbilledShared = if (includeSharedCharges) {
@@ -432,23 +530,27 @@ class RentLedgerRepository(
             val finalWaterCharge = round2(waterCharge + waterShared)
             val finalOtherCharge = round2(otherCharge + otherShared)
 
-            val readingId = meterReadingDao.insert(
-                MeterReadingEntity(
-                    unitId = unit.id,
-                    leaseId = lease.id,
-                    previousReading = previousReading,
-                    currentReading = currentReading,
-                    unitsConsumed = unitsConsumed,
-                    ratePerUnit = effectiveRate,
-                    electricityAmount = electricityCharge,
-                    photoPath = croppedPhotoPath,
-                    billingMonth = billingMonth,
-                    ocrRawText = ocrRawText,
-                    wasManuallyEdited = wasManuallyEdited
+            val readingId = if (isMetered) {
+                meterReadingDao.insert(
+                    MeterReadingEntity(
+                        unitId = unit.id,
+                        leaseId = lease.id,
+                        previousReading = previousReading,
+                        currentReading = currentReading,
+                        unitsConsumed = unitsConsumed,
+                        ratePerUnit = effectiveRate,
+                        electricityAmount = electricityCharge,
+                        photoPath = croppedPhotoPath,
+                        billingMonth = billingMonth,
+                        ocrRawText = ocrRawText,
+                        wasManuallyEdited = wasManuallyEdited
+                    )
                 )
-            )
+            } else null
 
-            unitDao.update(unit.copy(lastReading = currentReading))
+            if (isMetered) {
+                unitDao.update(unit.copy(lastReading = currentReading))
+            }
 
             val totalAmount = round2(
                 unit.baseRent + electricityCharge + finalWaterCharge + maintenanceCharge + finalOtherCharge + previousDue
@@ -468,7 +570,7 @@ class RentLedgerRepository(
                     billingMonth = billingMonth,
                     meterReadingId = readingId,
                     previousReading = previousReading,
-                    currentReading = currentReading,
+                    currentReading = if (isMetered) currentReading else previousReading,
                     unitsConsumed = unitsConsumed,
                     ratePerUnit = effectiveRate,
                     electricityCharge = electricityCharge,
@@ -539,9 +641,11 @@ class RentLedgerRepository(
                 ?: throw IllegalStateException("No active tenant to check out")
             val property = propertyDao.getById(unit.propertyId)
 
-            val effectiveRate = resolveElectricityRate(unit, property, settings).rate
-            val unitsUsed = max(0.0, finalReading - unit.lastReading)
-            val finalElectricity = round2(unitsUsed * effectiveRate)
+            val elecCfg = resolveElectricityConfig(unit, property, settings)
+            val isMetered = elecCfg.mode == ElectricityBillingMode.METERED
+            val effectiveRate = elecCfg.rate
+            val unitsUsed = if (isMetered) max(0.0, finalReading - unit.lastReading) else 0.0
+            val finalElectricity = if (isMetered) round2(unitsUsed * effectiveRate) else 0.0
             val unpaidDues = invoiceDao.getOutstandingBalanceForLease(lease.id)
             val unbilledShared = sharedChargeDao.getUnbilledForLease(unit.id, lease.id)
             val pendingSharedTotal = round2(unbilledShared.sumOf { it.amount })
@@ -613,41 +717,80 @@ class RentLedgerRepository(
         amount: Double,
         billingMonth: String,
         notes: String,
-        splitMode: ExpenseSplitMode
+        splitMode: ExpenseSplitMode,
+        unitId: Long? = null
     ): Long = db.withTransaction {
         val properties = propertyDao.getAllOnce()
-        val anchorPropertyId = if (properties.any { it.id == propertyId }) propertyId else {
-            properties.firstOrNull()?.id ?: throw IllegalStateException("No property available")
-        }
-
         val allUnits = unitDao.getAllOnce()
+        val selectedUnit = unitId?.let { targetId -> allUnits.find { it.id == targetId } }
+
+        val anchorPropertyId = selectedUnit?.propertyId
+            ?: if (properties.any { it.id == propertyId }) propertyId else {
+                properties.firstOrNull()?.id ?: throw IllegalStateException("No property available")
+            }
+        val effectiveAllProps = if (selectedUnit != null) false else appliesToAllProperties
+
         val activeLeases = leaseDao.getActiveLeasesOnce().associateBy { it.unitId }
         val propMap = properties.associateBy { it.id }
 
-        val targetOccupied = allUnits.mapNotNull { unit ->
-            val lease = activeLeases[unit.id] ?: return@mapNotNull null
-            val prop = propMap[unit.propertyId] ?: return@mapNotNull null
-            if (!appliesToAllProperties && unit.propertyId != anchorPropertyId) return@mapNotNull null
-            Triple(unit, prop, lease)
+        val targetOccupied = if (selectedUnit != null) {
+            val lease = activeLeases[selectedUnit.id]
+            val prop = propMap[selectedUnit.propertyId]
+            if (lease != null && prop != null) listOf(Triple(selectedUnit, prop, lease)) else emptyList()
+        } else {
+            allUnits.mapNotNull { unit ->
+                val lease = activeLeases[unit.id] ?: return@mapNotNull null
+                val prop = propMap[unit.propertyId] ?: return@mapNotNull null
+                if (!effectiveAllProps && unit.propertyId != anchorPropertyId) return@mapNotNull null
+                Triple(unit, prop, lease)
+            }
         }
 
-        val effectiveSplitMode = if (targetOccupied.isEmpty()) ExpenseSplitMode.OWNER_ONLY else splitMode
+        val effectiveSplitMode = when {
+            splitMode == ExpenseSplitMode.OWNER_ONLY -> ExpenseSplitMode.OWNER_ONLY
+            selectedUnit != null && targetOccupied.isNotEmpty() -> ExpenseSplitMode.SINGLE_ROOM
+            selectedUnit != null && targetOccupied.isEmpty() -> ExpenseSplitMode.OWNER_ONLY
+            targetOccupied.isEmpty() -> ExpenseSplitMode.OWNER_ONLY
+            else -> splitMode
+        }
         val cleanTitle = title.trim().ifBlank { category.label }
 
         val expenseId = expenseDao.insert(
             ExpenseEntity(
                 propertyId = anchorPropertyId,
+                unitId = selectedUnit?.id,
                 category = category,
                 title = cleanTitle,
                 amount = amount,
                 billingMonth = billingMonth,
                 notes = notes.trim(),
                 splitMode = effectiveSplitMode,
-                appliesToAllProperties = appliesToAllProperties
+                appliesToAllProperties = effectiveAllProps
             )
         )
 
-        if (effectiveSplitMode != ExpenseSplitMode.OWNER_ONLY && targetOccupied.isNotEmpty() && amount > 0.0) {
+        if (effectiveSplitMode == ExpenseSplitMode.SINGLE_ROOM && selectedUnit != null && targetOccupied.isNotEmpty() && amount > 0.0) {
+            val (_, _, lease) = targetOccupied.first()
+            sharedChargeDao.insertAll(
+                listOf(
+                    SharedChargeEntity(
+                        expenseId = expenseId,
+                        unitId = selectedUnit.id,
+                        leaseId = lease.id,
+                        propertyId = selectedUnit.propertyId,
+                        category = category,
+                        title = "$cleanTitle (${selectedUnit.unitName})",
+                        amount = round2(amount),
+                        billingMonth = billingMonth,
+                        invoiceId = null
+                    )
+                )
+            )
+        } else if (effectiveSplitMode != ExpenseSplitMode.OWNER_ONLY &&
+            effectiveSplitMode != ExpenseSplitMode.SINGLE_ROOM &&
+            targetOccupied.isNotEmpty() &&
+            amount > 0.0
+        ) {
             val preview = buildSplitPreview(
                 amount = amount,
                 splitMode = effectiveSplitMode,
@@ -706,12 +849,13 @@ class RentLedgerRepository(
 
     suspend fun exportAllDataSnapshot(): BackupSnapshot {
         return BackupSnapshot(
-            version = 2,
+            version = 3,
             exportedAt = System.currentTimeMillis(),
             settings = settingsStore.getOnce(),
             properties = propertyDao.getAllOnce(),
             units = unitDao.getAllOnce(),
             leases = leaseDao.getAllOnce(),
+            tenantDocuments = tenantDocumentDao.getAllOnce(),
             meterReadings = meterReadingDao.getAllOnce(),
             invoices = invoiceDao.getAllOnce(),
             payments = paymentDao.getAllOnce(),
@@ -726,6 +870,7 @@ class RentLedgerRepository(
             paymentDao.deleteAll()
             invoiceDao.deleteAll()
             meterReadingDao.deleteAll()
+            tenantDocumentDao.deleteAll()
             leaseDao.deleteAll()
             expenseDao.deleteAll()
             unitDao.deleteAll()
@@ -734,6 +879,9 @@ class RentLedgerRepository(
             propertyDao.insertAll(snapshot.properties)
             unitDao.insertAll(snapshot.units)
             leaseDao.insertAll(snapshot.leases)
+            if (snapshot.tenantDocuments.isNotEmpty()) {
+                tenantDocumentDao.insertAll(snapshot.tenantDocuments)
+            }
             meterReadingDao.insertAll(snapshot.meterReadings)
             invoiceDao.insertAll(snapshot.invoices)
             paymentDao.insertAll(snapshot.payments)
@@ -755,6 +903,7 @@ class RentLedgerRepository(
             paymentDao.deleteAll()
             invoiceDao.deleteAll()
             meterReadingDao.deleteAll()
+            tenantDocumentDao.deleteAll()
             leaseDao.deleteAll()
             expenseDao.deleteAll()
             unitDao.deleteAll()
@@ -857,18 +1006,22 @@ class RentLedgerRepository(
                 )
             )
 
-            // Active Leases (Room 101 has 4 persons, Room 102 has 2 persons, Shop G-01 has 1)
+            // Active Leases (Room 101 has 4 persons + 1 child < 5y, Room 102 has 2 persons, Shop G-01 has 1)
             val lease101Id = leaseDao.insert(
                 LeaseEntity(
                     unitId = r101Id,
                     propertyId = pgId,
                     tenantName = "Aarav Sharma",
                     tenantPhone = "9876543210",
+                    gender = TenantGender.MALE,
+                    maritalStatus = MaritalStatus.MARRIED,
                     tenantIdType = "Aadhaar",
                     tenantIdNumber = "XXXX-XXXX-4312",
                     securityDeposit = 15000.0,
                     rentDueDay = 5,
                     occupantCount = 4,
+                    childCountBelow5 = 1,
+                    childNotes = "Vihaan (3 yrs)",
                     initialReading = 4110.0,
                     checkInDate = now - 86_400_000L * 45,
                     isActive = true
@@ -880,11 +1033,14 @@ class RentLedgerRepository(
                     propertyId = pgId,
                     tenantName = "Priya Verma",
                     tenantPhone = "9811223344",
+                    gender = TenantGender.FEMALE,
+                    maritalStatus = MaritalStatus.SINGLE,
                     tenantIdType = "PAN",
                     tenantIdNumber = "ABCDE1234F",
                     securityDeposit = 12000.0,
                     rentDueDay = todayDay,
                     occupantCount = 2,
+                    childCountBelow5 = 0,
                     initialReading = 9650.0,
                     checkInDate = now - 86_400_000L * 60,
                     isActive = true
@@ -896,11 +1052,14 @@ class RentLedgerRepository(
                     propertyId = shopPropId,
                     tenantName = "Karan Electronics",
                     tenantPhone = "9900112233",
+                    gender = TenantGender.MALE,
+                    maritalStatus = MaritalStatus.MARRIED,
                     tenantIdType = "Aadhaar",
                     tenantIdNumber = "XXXX-XXXX-8890",
                     securityDeposit = 50000.0,
                     rentDueDay = 1,
                     occupantCount = 1,
+                    childCountBelow5 = 0,
                     initialReading = 8290.0,
                     checkInDate = now - 86_400_000L * 90,
                     isActive = true
@@ -1076,6 +1235,7 @@ class RentLedgerRepository(
             expenseDao.insert(
                 ExpenseEntity(
                     propertyId = pgId,
+                    unitId = r102Id,
                     category = ExpenseCategory.PLUMBER,
                     title = "Bathroom pipeline fix (Room 102)",
                     amount = 1450.0,
@@ -1118,6 +1278,7 @@ class RentLedgerRepository(
             paymentDao.deleteAll()
             invoiceDao.deleteAll()
             meterReadingDao.deleteAll()
+            tenantDocumentDao.deleteAll()
             leaseDao.deleteAll()
             expenseDao.deleteAll()
             unitDao.deleteAll()
@@ -1147,6 +1308,48 @@ class RentLedgerRepository(
             if (propRate != null) return ResolvedRate(propRate, "Property default")
 
             return ResolvedRate(settings.defaultRatePerUnit, "Common default")
+        }
+
+        fun resolveElectricityConfig(
+            unit: UnitEntity?,
+            property: PropertyEntity?,
+            settings: OwnerSettings
+        ): ResolvedElectricityConfig {
+            val mode = when {
+                unit != null && unit.electricityBillingMode != ElectricityBillingMode.INHERIT ->
+                    unit.electricityBillingMode
+                property != null && property.electricityBillingMode != ElectricityBillingMode.INHERIT ->
+                    property.electricityBillingMode
+                settings.defaultElectricityMode != ElectricityBillingMode.INHERIT ->
+                    settings.defaultElectricityMode
+                else -> ElectricityBillingMode.METERED
+            }
+            val resolvedRate = resolveElectricityRate(unit, property, settings)
+            return when (mode) {
+                ElectricityBillingMode.METERED ->
+                    ResolvedElectricityConfig(ElectricityBillingMode.METERED, resolvedRate.rate, resolvedRate.sourceLabel)
+                ElectricityBillingMode.SEPARATE_CONNECTION ->
+                    ResolvedElectricityConfig(ElectricityBillingMode.SEPARATE_CONNECTION, 0.0, "Separate EB Meter")
+                ElectricityBillingMode.INCLUDED_IN_RENT ->
+                    ResolvedElectricityConfig(ElectricityBillingMode.INCLUDED_IN_RENT, 0.0, "Included in Rent")
+                ElectricityBillingMode.INHERIT ->
+                    ResolvedElectricityConfig(ElectricityBillingMode.METERED, resolvedRate.rate, resolvedRate.sourceLabel)
+            }
+        }
+
+        fun buildBulkUnitNames(
+            prefix: String,
+            startNumber: Int,
+            endNumber: Int,
+            zeroPadWidth: Int = 0
+        ): List<String> {
+            val low = minOf(startNumber, endNumber).coerceAtLeast(0)
+            val high = maxOf(startNumber, endNumber).coerceAtMost(low + 49)
+            val cleanPrefix = prefix.trim()
+            return (low..high).map { num ->
+                val numStr = if (zeroPadWidth > 1) num.toString().padStart(zeroPadWidth, '0') else num.toString()
+                if (cleanPrefix.isEmpty()) numStr else "$cleanPrefix $numStr"
+            }
         }
 
         fun resolveDefaultDeposit(
@@ -1258,6 +1461,7 @@ class RentLedgerRepository(
                     round2(max(0.0, amount - allocated))
                 } else {
                     val raw = when (splitMode) {
+                        ExpenseSplitMode.SINGLE_ROOM -> amount
                         ExpenseSplitMode.EQUAL_PER_ROOM -> perRoomRaw
                         ExpenseSplitMode.PER_PERSON -> perPersonRaw * persons
                         ExpenseSplitMode.OWNER_ONLY -> 0.0
@@ -1299,6 +1503,13 @@ class RentLedgerRepository(
     }
 }
 
+data class PendingTenantDocument(
+    val title: String,
+    val docType: TenantDocumentType,
+    val filePath: String,
+    val mimeType: String = "image/jpeg"
+)
+
 data class CheckOutResult(
     val propertyName: String,
     val unitName: String,
@@ -1325,5 +1536,6 @@ data class BackupSnapshot(
     val invoices: List<InvoiceEntity>,
     val payments: List<PaymentEntity>,
     val expenses: List<ExpenseEntity>,
-    val sharedCharges: List<SharedChargeEntity> = emptyList()
+    val sharedCharges: List<SharedChargeEntity> = emptyList(),
+    val tenantDocuments: List<TenantDocumentEntity> = emptyList()
 )

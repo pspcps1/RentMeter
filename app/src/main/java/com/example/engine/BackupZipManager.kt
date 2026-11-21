@@ -50,7 +50,7 @@ class BackupZipManager(
                     }
                 }
             }
-            "Backup exported (${snapshot.properties.size} properties, ${snapshot.invoices.size} invoices)"
+            "Backup exported (${snapshot.properties.size} properties, ${snapshot.invoices.size} invoices, ${snapshot.tenantDocuments.size} docs)"
         }
     }
 

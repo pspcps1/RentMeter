@@ -4,12 +4,16 @@ import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import com.example.data.model.ElectricityBillingMode
 import com.example.data.model.ExpenseCategory
 import com.example.data.model.ExpenseSplitMode
 import com.example.data.model.InvoiceStatus
+import com.example.data.model.MaritalStatus
 import com.example.data.model.MeterType
 import com.example.data.model.PaymentMethod
 import com.example.data.model.PropertyType
+import com.example.data.model.TenantDocumentType
+import com.example.data.model.TenantGender
 import com.example.data.model.WaterRateMode
 import kotlinx.serialization.Serializable
 
@@ -22,6 +26,7 @@ data class PropertyEntity(
     val address: String = "",
     val defaultRatePerUnit: Double = 8.0,
     val electricityRateOverride: Double? = null,
+    val electricityBillingMode: ElectricityBillingMode = ElectricityBillingMode.INHERIT,
     val waterMode: WaterRateMode = WaterRateMode.INHERIT,
     val waterRate: Double? = null,
     val defaultDepositOverride: Double? = null,
@@ -49,6 +54,7 @@ data class UnitEntity(
     val baseRent: Double,
     val ratePerUnit: Double = 0.0,
     val electricityRateOverride: Double? = null,
+    val electricityBillingMode: ElectricityBillingMode = ElectricityBillingMode.INHERIT,
     val waterMode: WaterRateMode = WaterRateMode.INHERIT,
     val waterRate: Double? = null,
     val depositOverride: Double? = null,
@@ -78,12 +84,20 @@ data class LeaseEntity(
     val propertyId: Long,
     val tenantName: String,
     val tenantPhone: String,
+    val gender: TenantGender = TenantGender.UNSPECIFIED,
+    val maritalStatus: MaritalStatus = MaritalStatus.UNSPECIFIED,
+    val profilePhotoPath: String? = null,
     val tenantIdType: String = "Aadhaar",
     val tenantIdNumber: String = "",
     val idPhotoPath: String? = null,
     val securityDeposit: Double = 0.0,
+    val defaultMaintenanceCharge: Double = 0.0,
+    val defaultOtherCharge: Double = 0.0,
+    val defaultOtherChargeLabel: String = "",
     val rentDueDay: Int = 5,
-    val occupantCount: Int = 1,
+    val occupantCount: Int = 1, // Persons 5+ years & Adults (billed in per-person splits)
+    val childCountBelow5: Int = 0, // Children < 5 years (tracked separately, excluded from per-person charges)
+    val childNotes: String = "",
     val initialReading: Double = 0.0,
     val initialPhotoPath: String? = null,
     val checkInDate: Long = System.currentTimeMillis(),
@@ -94,6 +108,29 @@ data class LeaseEntity(
     val deductionNotes: String = "",
     val depositRefunded: Double? = null,
     val isActive: Boolean = true
+)
+
+@Serializable
+@Entity(
+    tableName = "tenant_documents",
+    foreignKeys = [
+        ForeignKey(
+            entity = LeaseEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["leaseId"],
+            onDelete = ForeignKey.CASCADE
+        )
+    ],
+    indices = [Index("leaseId")]
+)
+data class TenantDocumentEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val leaseId: Long,
+    val title: String,
+    val docType: TenantDocumentType = TenantDocumentType.OTHER,
+    val filePath: String,
+    val mimeType: String = "image/jpeg",
+    val addedAt: Long = System.currentTimeMillis()
 )
 
 @Serializable
@@ -204,6 +241,7 @@ data class PaymentEntity(
 data class ExpenseEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val propertyId: Long,
+    val unitId: Long? = null,
     val category: ExpenseCategory = ExpenseCategory.REPAIR,
     val title: String,
     val amount: Double,

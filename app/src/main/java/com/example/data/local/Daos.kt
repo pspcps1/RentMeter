@@ -86,6 +86,9 @@ interface LeaseDao {
     @Query("SELECT * FROM leases WHERE id = :id")
     suspend fun getById(id: Long): LeaseEntity?
 
+    @Query("SELECT * FROM leases WHERE id = :id")
+    fun observeById(id: Long): Flow<LeaseEntity?>
+
     @Query("SELECT * FROM leases WHERE unitId = :unitId AND isActive = 1 LIMIT 1")
     suspend fun getActiveLeaseForUnit(unitId: Long): LeaseEntity?
 
@@ -101,10 +104,37 @@ interface LeaseDao {
     @Query("UPDATE leases SET occupantCount = :occupantCount WHERE id = :leaseId")
     suspend fun updateOccupantCount(leaseId: Long, occupantCount: Int)
 
+    @Query("UPDATE leases SET occupantCount = :occupantCount, childCountBelow5 = :childCountBelow5, childNotes = :childNotes WHERE id = :leaseId")
+    suspend fun updateHouseholdCounts(leaseId: Long, occupantCount: Int, childCountBelow5: Int, childNotes: String)
+
     @Query("UPDATE leases SET securityDeposit = :securityDeposit WHERE id = :leaseId")
     suspend fun updateSecurityDeposit(leaseId: Long, securityDeposit: Double)
 
     @Query("DELETE FROM leases")
+    suspend fun deleteAll()
+}
+
+@Dao
+interface TenantDocumentDao {
+    @Query("SELECT * FROM tenant_documents ORDER BY addedAt DESC")
+    fun observeAll(): Flow<List<TenantDocumentEntity>>
+
+    @Query("SELECT * FROM tenant_documents ORDER BY addedAt DESC")
+    suspend fun getAllOnce(): List<TenantDocumentEntity>
+
+    @Query("SELECT * FROM tenant_documents WHERE leaseId = :leaseId ORDER BY addedAt DESC")
+    fun observeByLease(leaseId: Long): Flow<List<TenantDocumentEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(doc: TenantDocumentEntity): Long
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(docs: List<TenantDocumentEntity>)
+
+    @Delete
+    suspend fun delete(doc: TenantDocumentEntity)
+
+    @Query("DELETE FROM tenant_documents")
     suspend fun deleteAll()
 }
 

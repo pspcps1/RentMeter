@@ -56,7 +56,9 @@ import coil.compose.AsyncImage
 import com.example.data.local.LeaseEntity
 import com.example.data.local.PropertyEntity
 import com.example.data.local.UnitEntity
+import com.example.data.model.ElectricityBillingMode
 import com.example.data.repository.CheckOutResult
+import com.example.data.repository.ResolvedElectricityConfig
 import com.example.engine.PdfInvoiceGenerator
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.LocalRentStatusColors
@@ -82,7 +84,9 @@ fun CheckOutScreen(
     var property by remember { mutableStateOf<PropertyEntity?>(null) }
     var lease by remember { mutableStateOf<LeaseEntity?>(null) }
     var unpaidDues by remember { mutableStateOf(0.0) }
-    var effectiveRate by remember { mutableStateOf(8.0) }
+    var elecConfig by remember {
+        mutableStateOf(ResolvedElectricityConfig(ElectricityBillingMode.METERED, 8.0, "Common default"))
+    }
 
     var finalReadingText by remember { mutableStateOf(scannedFinalReading) }
     var damageDeductionText by remember { mutableStateOf("0") }
@@ -95,7 +99,7 @@ fun CheckOutScreen(
         unit = loadedUnit
         if (loadedUnit != null) {
             property = viewModel.repository.getPropertyById(loadedUnit.propertyId)
-            effectiveRate = viewModel.repository.getEffectiveElectricityRateForUnit(unitId).rate
+            elecConfig = viewModel.repository.getEffectiveElectricityConfigForUnit(unitId)
             val active = viewModel.repository.getActiveLeaseForUnit(unitId)
             lease = active
             if (active != null) {
@@ -109,10 +113,11 @@ fun CheckOutScreen(
         }
     }
 
+    val isMetered = elecConfig.mode == ElectricityBillingMode.METERED
     val prevReading = unit?.lastReading ?: 0.0
     val finalReading = finalReadingText.toDoubleOrNull() ?: prevReading
-    val unitsUsed = max(0.0, finalReading - prevReading)
-    val finalElec = unitsUsed * effectiveRate
+    val unitsUsed = if (isMetered) max(0.0, finalReading - prevReading) else 0.0
+    val finalElec = if (isMetered) unitsUsed * elecConfig.rate else 0.0
     val damageDeduction = max(0.0, damageDeductionText.toDoubleOrNull() ?: 0.0)
     val deposit = lease?.securityDeposit ?: 0.0
     val netRefund = deposit - (finalElec + unpaidDues + damageDeduction)
@@ -223,48 +228,69 @@ fun CheckOutScreen(
                 }
 
                 // Final Meter Scan Section
-                Surface(
-                    shape = RoundedCornerShape(16.dp),
-                    color = MaterialTheme.colorScheme.surface,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
-                ) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth().padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                if (isMetered) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Text("Final Meter Reading", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-                            OutlinedButton(onClick = onLaunchFinalScan) {
-                                Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Scan Meter")
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Final Meter Reading", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                                OutlinedButton(onClick = onLaunchFinalScan) {
+                                    Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Scan Meter")
+                                }
                             }
-                        }
 
-                        if (scannedFinalPhotoPath.isNotBlank() && File(scannedFinalPhotoPath).exists()) {
-                            AsyncImage(
-                                model = File(scannedFinalPhotoPath),
-                                contentDescription = "Final meter proof",
-                                contentScale = ContentScale.FillWidth,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(90.dp)
-                                    .clip(RoundedCornerShape(8.dp))
+                            if (scannedFinalPhotoPath.isNotBlank() && File(scannedFinalPhotoPath).exists()) {
+                                AsyncImage(
+                                    model = File(scannedFinalPhotoPath),
+                                    contentDescription = "Final meter proof",
+                                    contentScale = ContentScale.FillWidth,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(90.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                )
+                            }
+
+                            OutlinedTextField(
+                                value = finalReadingText,
+                                onValueChange = { finalReadingText = it },
+                                label = { Text("Final Reading (Prev: ${PdfInvoiceGenerator.formatUnits(prevReading)} kWh)") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth().testTag("checkout_final_reading")
                             )
                         }
-
-                        OutlinedTextField(
-                            value = finalReadingText,
-                            onValueChange = { finalReadingText = it },
-                            label = { Text("Final Reading (Prev: ${PdfInvoiceGenerator.formatUnits(prevReading)} kWh)") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth().testTag("checkout_final_reading")
-                        )
+                    }
+                } else {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(14.dp)) {
+                            Text(
+                                "Electricity: ${elecConfig.mode.label}",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                elecConfig.mode.subtitle + ". Final electricity deduction is ₹0.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 }
 
@@ -327,7 +353,7 @@ fun CheckOutScreen(
 
                 Button(
                     onClick = {
-                        val fRead = finalReadingText.toDoubleOrNull() ?: return@Button
+                        val fRead = if (isMetered) (finalReadingText.toDoubleOrNull() ?: return@Button) else prevReading
                         isSaving = true
                         scope.launch {
                             val res = viewModel.repository.completeCheckOut(
@@ -341,7 +367,7 @@ fun CheckOutScreen(
                             isSaving = false
                         }
                     },
-                    enabled = !isSaving && lease != null && finalReadingText.toDoubleOrNull() != null,
+                    enabled = !isSaving && lease != null && (!isMetered || finalReadingText.toDoubleOrNull() != null),
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                     modifier = Modifier
                         .fillMaxWidth()

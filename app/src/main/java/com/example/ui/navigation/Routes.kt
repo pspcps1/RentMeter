@@ -32,4 +32,8 @@ sealed interface Route {
         val finalReading: String = "",
         val finalPhotoPath: String = ""
     ) : Route
+
+    @Serializable data class TenantProfile(val leaseId: Long) : Route
+
+    @Serializable data class RentAgreement(val leaseId: Long) : Route
 }

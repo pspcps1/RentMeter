@@ -26,16 +26,22 @@ import com.example.data.local.LeaseEntity
 import com.example.data.local.PropertyEntity
 import com.example.data.local.RentLedgerDatabase
 import com.example.data.local.UnitEntity
+import com.example.data.model.ElectricityBillingMode
 import com.example.data.model.ExpenseCategory
 import com.example.data.model.ExpenseSplitMode
 import com.example.data.model.InvoiceStatus
+import com.example.data.model.MaritalStatus
 import com.example.data.model.PropertyType
+import com.example.data.model.TenantGender
 import com.example.data.model.WaterRateMode
 import com.example.data.preferences.OwnerSettings
 import com.example.data.preferences.SettingsDataStore
 import com.example.data.repository.RentLedgerRepository
+import com.example.data.repository.TaskKind
 import com.example.data.repository.UnitWithContext
 import com.example.engine.NormalizedRoi
+import com.example.engine.RentAgreementGenerator
+import com.example.engine.RentAgreementInput
 import com.example.ui.components.AppFormBottomSheet
 import com.example.ui.components.ConfirmActionDialog
 import com.example.ui.components.FormSectionCard
@@ -43,6 +49,8 @@ import com.example.ui.screens.DraggableRoiViewfinderOverlay
 import com.example.ui.screens.GalleryManualCropView
 import com.example.ui.screens.ReportsScreen
 import com.example.ui.theme.RentLedgerTheme
+import java.io.File
+import java.util.Calendar
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -405,14 +413,41 @@ class ExampleRobolectricTest {
         composeRule.waitForIdle()
         assertTrue("Gallery ROI top should move down (> $afterUpTop), was ${galleryRoi.top}", galleryRoi.top > afterUpTop + 0.15f)
 
-        // Reset and Taller buttons
+        // Reset button restores initial ROI
         composeRule.onNodeWithTag("crop_reset_button").performClick()
         composeRule.waitForIdle()
         assertEquals(0.38f, galleryRoi.top, 0.001f)
+        assertEquals(0.92f, galleryRoi.right, 0.001f)
 
-        composeRule.onNodeWithTag("crop_taller_button").performClick()
+        // Drag RIGHT border inward (left) directly to shrink width
+        val initialLeft = galleryRoi.left
+        composeRule.onNodeWithTag("gallery_crop_canvas").performTouchInput {
+            val startX = width * galleryRoi.right
+            val midY = height * (galleryRoi.top + galleryRoi.height / 2f)
+            swipe(
+                start = Offset(startX, midY),
+                end = Offset(startX - width * 0.25f, midY),
+                durationMillis = 200
+            )
+        }
         composeRule.waitForIdle()
-        assertTrue(galleryRoi.height > 0.18f)
+        assertEquals(initialLeft, galleryRoi.left, 0.005f)
+        assertTrue("Right border drag should narrow ROI (< 0.85f), was ${galleryRoi.right}", galleryRoi.right < 0.85f)
+
+        // Drag BOTTOM border downward directly to make box taller
+        val initialTop = galleryRoi.top
+        composeRule.onNodeWithTag("gallery_crop_canvas").performTouchInput {
+            val midX = width * (galleryRoi.left + galleryRoi.width / 2f)
+            val startY = height * galleryRoi.bottom
+            swipe(
+                start = Offset(midX, startY),
+                end = Offset(midX, startY + height * 0.18f),
+                durationMillis = 200
+            )
+        }
+        composeRule.waitForIdle()
+        assertEquals(initialTop, galleryRoi.top, 0.005f)
+        assertTrue("Bottom border drag should increase ROI height (> 0.22f), was ${galleryRoi.height}", galleryRoi.height > 0.22f)
 
         // Switch to live viewfinder overlay and drag UP
         showLive = true
@@ -493,5 +528,353 @@ class ExampleRobolectricTest {
         assertEquals(350.0, resolved1p.computedCharge, 0.01)
         assertEquals(350.0, resolved4p.computedCharge, 0.01)
         assertEquals("Common default", resolved1p.sourceLabel)
+    }
+
+    @Test
+    fun rentGenerationDay_resolvesLastDayAcrossMonthsAndCustomDays() {
+        val febLeap = Calendar.getInstance().apply { set(2024, Calendar.FEBRUARY, 10) }
+        val febNonLeap = Calendar.getInstance().apply { set(2025, Calendar.FEBRUARY, 10) }
+        val april = Calendar.getInstance().apply { set(2025, Calendar.APRIL, 5) }
+        val dec = Calendar.getInstance().apply { set(2025, Calendar.DECEMBER, 1) }
+
+        assertEquals(29, SettingsDataStore.resolveBillingDayForMonth(0, febLeap))
+        assertEquals(28, SettingsDataStore.resolveBillingDayForMonth(0, febNonLeap))
+        assertEquals(30, SettingsDataStore.resolveBillingDayForMonth(0, april))
+        assertEquals(31, SettingsDataStore.resolveBillingDayForMonth(0, dec))
+
+        assertEquals(15, SettingsDataStore.resolveBillingDayForMonth(15, febNonLeap))
+        assertEquals("Last day of month", SettingsDataStore.formatGenerationDayLabel(0))
+        assertEquals("1st of every month", SettingsDataStore.formatGenerationDayLabel(1))
+    }
+
+    @Test
+    fun flexibleElectricityModes_zeroOutMeterChargesAndSuppressScanTasks() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, RentLedgerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val settingsStore = SettingsDataStore(context)
+        settingsStore.updateSettings(OwnerSettings(defaultElectricityMode = ElectricityBillingMode.METERED, defaultRatePerUnit = 9.0))
+        val repo = RentLedgerRepository(db, settingsStore)
+
+        val propId = repo.saveProperty(PropertyEntity(name = "Bangalore Residency", type = PropertyType.PG))
+        val sepUnitId = repo.saveUnit(
+            UnitEntity(
+                propertyId = propId,
+                unitName = "Flat 101",
+                baseRent = 12000.0,
+                electricityBillingMode = ElectricityBillingMode.SEPARATE_CONNECTION,
+                lastReading = 100.0
+            )
+        )
+        val incUnitId = repo.saveUnit(
+            UnitEntity(
+                propertyId = propId,
+                unitName = "Flat 102",
+                baseRent = 13500.0,
+                electricityBillingMode = ElectricityBillingMode.INCLUDED_IN_RENT,
+                lastReading = 200.0
+            )
+        )
+
+        repo.checkInTenant(sepUnitId, "Karthik", "9800011111", "Aadhaar", "", null, 25000.0, 5, 1, 100.0, null)
+        repo.checkInTenant(incUnitId, "Meera", "9800022222", "Aadhaar", "", null, 25000.0, 5, 1, 200.0, null)
+
+        val summary = repo.observeDashboardSummary().first()
+        assertTrue(summary.tasks.none { it.kind == TaskKind.SCAN_METER })
+
+        val invSepId = repo.createBillAndSaveReading(sepUnitId, 999.0, null, "", false, 0.0, 500.0, 0.0, true)
+        val invSep = repo.getInvoiceById(invSepId)!!
+        assertEquals(0.0, invSep.unitsConsumed, 0.01)
+        assertEquals(0.0, invSep.electricityCharge, 0.01)
+        assertEquals(12500.0, invSep.totalAmount, 0.01)
+
+        val checkout = repo.completeCheckOut(incUnitId, 500.0, null, 0.0, "")
+        assertEquals(0.0, checkout.finalElectricity, 0.01)
+        assertEquals(0.0, checkout.unitsUsed, 0.01)
+        assertEquals(25000.0, checkout.netRefund, 0.01)
+        db.close()
+    }
+
+    @Test
+    fun bulkUnitCreation_generatesPaddedRangeAndPersistsAll() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, RentLedgerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val repo = RentLedgerRepository(db, SettingsDataStore(context))
+        val propId = repo.saveProperty(PropertyEntity(name = "Metro PG", type = PropertyType.PG))
+
+        val names = RentLedgerRepository.buildBulkUnitNames(
+            prefix = "Room",
+            startNumber = 101,
+            endNumber = 104,
+            zeroPadWidth = 3
+        )
+        assertEquals(listOf("Room 101", "Room 102", "Room 103", "Room 104"), names)
+
+        val padded = RentLedgerRepository.buildBulkUnitNames(
+            prefix = "Unit",
+            startNumber = 1,
+            endNumber = 3,
+            zeroPadWidth = 3
+        )
+        assertEquals(listOf("Unit 001", "Unit 002", "Unit 003"), padded)
+
+        repo.saveUnitsBulk(
+            names.map { unitName ->
+                UnitEntity(propertyId = propId, unitName = unitName, baseRent = 8000.0)
+            }
+        )
+        assertEquals(4, repo.unitsFlow.first().size)
+        db.close()
+    }
+
+    @Test
+    fun tenantDemographicsAndRecurringCharges_excludeChildrenUnder5FromWaterSplitAndUpdateExpectedTotal() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, RentLedgerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val settingsStore = SettingsDataStore(context)
+        settingsStore.updateSettings(
+            OwnerSettings(
+                defaultRatePerUnit = 8.0,
+                defaultWaterMode = WaterRateMode.PER_PERSON,
+                defaultWaterRate = 200.0
+            )
+        )
+        val repo = RentLedgerRepository(db, settingsStore)
+        val propId = repo.saveProperty(PropertyEntity(name = "Family Nest", type = PropertyType.HOUSE))
+        val u1 = repo.saveUnit(UnitEntity(propertyId = propId, unitName = "A-1", baseRent = 10000.0))
+        val u2 = repo.saveUnit(UnitEntity(propertyId = propId, unitName = "A-2", baseRent = 10000.0))
+
+        // Tenant 1: 2 adults/children 5+y AND 2 toddlers <5y + recurring ₹450 maintenance & ₹250 parking
+        val l1 = repo.checkInTenant(
+            unitId = u1,
+            tenantName = "Rohan & Ananya",
+            tenantPhone = "9876501111",
+            idType = "Aadhaar",
+            idNumber = "1111",
+            idPhotoPath = null,
+            securityDeposit = 20000.0,
+            rentDueDay = 5,
+            occupantCount = 2,
+            initialReading = 100.0,
+            initialPhotoPath = null,
+            gender = TenantGender.MALE,
+            maritalStatus = MaritalStatus.MARRIED,
+            childCountBelow5 = 2,
+            childNotes = "Twins (2 yrs)",
+            defaultMaintenanceCharge = 450.0,
+            defaultOtherCharge = 250.0,
+            defaultOtherChargeLabel = "Parking"
+        )
+        // Tenant 2: 2 persons (5+y), 0 children <5y
+        repo.checkInTenant(
+            unitId = u2,
+            tenantName = "Kiran",
+            tenantPhone = "9876502222",
+            idType = "PAN",
+            idNumber = "ABCDE1234F",
+            idPhotoPath = null,
+            securityDeposit = 20000.0,
+            rentDueDay = 5,
+            occupantCount = 2,
+            initialReading = 100.0,
+            initialPhotoPath = null
+        )
+
+        val savedLease = repo.getLeaseById(l1)!!
+        assertEquals(TenantGender.MALE, savedLease.gender)
+        assertEquals(MaritalStatus.MARRIED, savedLease.maritalStatus)
+        assertEquals(2, savedLease.occupantCount)
+        assertEquals(2, savedLease.childCountBelow5)
+        assertEquals(450.0, savedLease.defaultMaintenanceCharge, 0.01)
+        assertEquals(250.0, savedLease.defaultOtherCharge, 0.01)
+        assertEquals("Parking", savedLease.defaultOtherChargeLabel)
+
+        // Water tanker ₹800 split PER_PERSON counts only 2+2=4 persons (excludes 2 toddlers <5y) => ₹400 each
+        repo.saveExpenseWithSplit(
+            propertyId = propId,
+            appliesToAllProperties = false,
+            category = ExpenseCategory.WATER_TANKER,
+            title = "Tanker",
+            amount = 800.0,
+            billingMonth = RentLedgerRepository.currentBillingMonth(),
+            notes = "",
+            splitMode = ExpenseSplitMode.PER_PERSON
+        )
+        assertEquals(400.0, repo.getUnbilledSharedChargesForLease(u1, l1).first().amount, 0.01)
+
+        // Dashboard expected total:
+        // U1: 10000 rent + 400 water + 450 maint + 250 parking + 400 tanker = 11500
+        // U2: 10000 rent + 400 water + 400 tanker = 10800
+        // Total = 22300
+        val dash = repo.observeDashboardSummary().first()
+        assertEquals(22300.0, dash.expectedAmount, 0.01)
+        db.close()
+    }
+
+    @Test
+    fun roomLevelExpense_singleRoomVsOwnerOnly_routesChargesCorrectly() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, RentLedgerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val repo = RentLedgerRepository(db, SettingsDataStore(context))
+        val propId = repo.saveProperty(PropertyEntity(name = "Green Heights", type = PropertyType.PG))
+        val u1 = repo.saveUnit(UnitEntity(propertyId = propId, unitName = "Room 101", baseRent = 7000.0))
+        val u2 = repo.saveUnit(UnitEntity(propertyId = propId, unitName = "Room 102", baseRent = 7000.0))
+
+        val l1 = repo.checkInTenant(u1, "Deepak", "9911001100", "Aadhaar", "", null, 10000.0, 5, 1, 0.0, null)
+        val l2 = repo.checkInTenant(u2, "Suresh", "9922002200", "Aadhaar", "", null, 10000.0, 5, 1, 0.0, null)
+
+        // Plumber for Room 101 charged back to Room 101 tenant
+        repo.saveExpenseWithSplit(
+            propertyId = propId,
+            appliesToAllProperties = false,
+            category = ExpenseCategory.PLUMBER,
+            title = "Tap Replacement",
+            amount = 650.0,
+            billingMonth = RentLedgerRepository.currentBillingMonth(),
+            notes = "Kitchen sink",
+            splitMode = ExpenseSplitMode.SINGLE_ROOM,
+            unitId = u1
+        )
+        // Electrical repair for Room 101 paid by Owner (no tenant charge)
+        repo.saveExpenseWithSplit(
+            propertyId = propId,
+            appliesToAllProperties = false,
+            category = ExpenseCategory.ELECTRICIAN,
+            title = "MCB Upgrade",
+            amount = 900.0,
+            billingMonth = RentLedgerRepository.currentBillingMonth(),
+            notes = "Owner covered",
+            splitMode = ExpenseSplitMode.OWNER_ONLY,
+            unitId = u1
+        )
+
+        val u1Charges = repo.getUnbilledSharedChargesForLease(u1, l1)
+        val u2Charges = repo.getUnbilledSharedChargesForLease(u2, l2)
+        assertEquals(1, u1Charges.size)
+        assertEquals(650.0, u1Charges.first().amount, 0.01)
+        assertTrue(u2Charges.isEmpty())
+        assertEquals(2, repo.expensesFlow.first().count { it.unitId == u1 })
+        db.close()
+    }
+
+    @Test
+    fun rentAgreementGenerator_producesValidSignedPngInAppMediaVault() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val result = RentAgreementGenerator.generateSignedAgreementPng(
+            context = context,
+            leaseId = 42L,
+            input = RentAgreementInput(
+                landlordName = "Rajesh Kumar",
+                landlordPhone = "9811100000",
+                businessName = "Sunrise Homes",
+                tenantName = "Aarav Sharma",
+                tenantPhone = "9876543210",
+                tenantIdType = "Aadhaar",
+                tenantIdNumber = "XXXX-1234",
+                gender = TenantGender.MALE,
+                maritalStatus = MaritalStatus.MARRIED,
+                occupantCount = 2,
+                childCountBelow5 = 1,
+                childNotes = "1 infant",
+                propertyName = "Sunrise Residency",
+                unitName = "Room 101",
+                premisesAddress = "Indiranagar, Bengaluru",
+                cityOrPlace = "Bengaluru",
+                monthlyRent = 12000.0,
+                maintenanceCharge = 500.0,
+                otherCharge = 0.0,
+                otherChargeLabel = "",
+                securityDeposit = 30000.0,
+                electricityBillingMode = ElectricityBillingMode.SEPARATE_CONNECTION,
+                electricityRatePerUnit = 0.0,
+                waterSummary = "Fixed ₹300/month",
+                rentDueDay = 5,
+                landlordSignatureStrokes = listOf(listOf(Offset(0.1f, 0.5f), Offset(0.8f, 0.4f))),
+                tenantSignatureStrokes = listOf(listOf(Offset(0.2f, 0.6f), Offset(0.7f, 0.3f)))
+            )
+        )
+        val file = File(result.filePath)
+        assertTrue(file.exists())
+        assertTrue(file.length() > 1024L)
+        assertEquals("image/png", result.mimeType)
+        assertTrue(result.filePath.contains("media/tenant_docs"))
+        file.delete()
+    }
+
+    @Test
+    fun reportsScreen_displaysExpensesByRoomAndTenantWiseReportSections() {
+        val month = RentLedgerRepository.currentBillingMonth()
+        val prop = PropertyEntity(id = 1L, name = "Lakeview PG", type = PropertyType.PG)
+        val unit = UnitEntity(id = 10L, propertyId = 1L, unitName = "Room 204", baseRent = 9000.0)
+        val lease = LeaseEntity(
+            id = 20L,
+            unitId = 10L,
+            propertyId = 1L,
+            tenantName = "Nisha Patel",
+            tenantPhone = "9898989898",
+            gender = TenantGender.FEMALE,
+            maritalStatus = MaritalStatus.SINGLE,
+            occupantCount = 2,
+            childCountBelow5 = 1,
+            securityDeposit = 18000.0
+        )
+        val expense = com.example.data.local.ExpenseEntity(
+            id = 30L,
+            propertyId = 1L,
+            unitId = 10L,
+            category = ExpenseCategory.PLUMBER,
+            title = "Geyser Pipe Fix",
+            amount = 750.0,
+            billingMonth = month,
+            splitMode = ExpenseSplitMode.OWNER_ONLY
+        )
+        val invoice = InvoiceEntity(
+            id = 40L,
+            invoiceNumber = "INV-204",
+            unitId = 10L,
+            leaseId = 20L,
+            propertyId = 1L,
+            billingMonth = month,
+            totalAmount = 9500.0,
+            paidAmount = 9500.0,
+            status = InvoiceStatus.PAID
+        )
+
+        composeRule.setContent {
+            RentLedgerTheme {
+                ReportsScreen(
+                    properties = listOf(prop),
+                    unitsWithContext = listOf(
+                        UnitWithContext(
+                            unit = unit,
+                            property = prop,
+                            activeLease = lease,
+                            latestInvoice = invoice,
+                            unpaidBalance = 0.0
+                        )
+                    ),
+                    invoices = listOf(invoice),
+                    expenses = listOf(expense),
+                    leases = listOf(lease),
+                    onOpenInvoice = {}
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("reports_lazy_column").performScrollToNode(hasText("Expenses by Room", substring = true))
+        composeRule.onNodeWithText("Expenses by Room", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithTag("reports_lazy_column").performScrollToNode(hasText("Tenant-Wise Report"))
+        composeRule.onNodeWithText("Tenant-Wise Report").assertIsDisplayed()
+        composeRule.onNodeWithTag("reports_lazy_column").performScrollToNode(hasText("Nisha Patel"))
+        composeRule.onNodeWithText("Nisha Patel").assertIsDisplayed()
+        composeRule.onNodeWithText("Female • Single • 2p + 1 <5y").assertIsDisplayed()
     }
 }

@@ -18,7 +18,10 @@ import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -79,7 +82,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -99,7 +104,6 @@ import com.example.engine.PdfInvoiceGenerator
 import com.example.ui.viewmodel.RentLedgerViewModel
 import kotlinx.coroutines.launch
 import java.io.File
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -108,7 +112,11 @@ private enum class RoiDragMode {
     RESIZE_TOP,
     RESIZE_BOTTOM,
     RESIZE_LEFT,
-    RESIZE_RIGHT
+    RESIZE_RIGHT,
+    RESIZE_TOP_LEFT,
+    RESIZE_TOP_RIGHT,
+    RESIZE_BOTTOM_LEFT,
+    RESIZE_BOTTOM_RIGHT
 }
 
 private val DefaultGalleryRoi = NormalizedRoi(
@@ -576,7 +584,9 @@ internal fun DraggableRoiViewfinderOverlay(
     val density = LocalDensity.current
 
     BoxWithConstraints(modifier = modifier) {
-        val edgeTolerancePx = with(density) { 14.dp.toPx() }
+        val outerTolPx = with(density) { 24.dp.toPx() }
+        val innerVTolMaxPx = with(density) { 12.dp.toPx() }
+        val innerHTolMaxPx = with(density) { 16.dp.toPx() }
         val pillOffsetY = with(density) {
             val topPx = constraints.maxHeight * roi.top
             max(110f, topPx - 32.dp.toPx()).roundToInt()
@@ -587,53 +597,20 @@ internal fun DraggableRoiViewfinderOverlay(
                 .fillMaxSize()
                 .testTag("live_roi_overlay")
                 .pointerInput(Unit) {
-                    var dragMode = RoiDragMode.MOVE
-                    var activeRoi = latestRoi
-                    detectDragGestures(
-                        onDragStart = { start ->
-                            activeRoi = latestRoi
-                            val topPx = size.height * activeRoi.top
-                            val bottomPx = size.height * activeRoi.bottom
-                            val vTol = minOf(edgeTolerancePx, (bottomPx - topPx) * 0.22f)
-                            val inHorizontal = start.x in (size.width * activeRoi.left - edgeTolerancePx)..(size.width * activeRoi.right + edgeTolerancePx)
-                            dragMode = when {
-                                inHorizontal && abs(start.y - topPx) <= vTol -> RoiDragMode.RESIZE_TOP
-                                inHorizontal && abs(start.y - bottomPx) <= vTol -> RoiDragMode.RESIZE_BOTTOM
-                                else -> RoiDragMode.MOVE
-                            }
-                        },
-                        onDrag = { change, dragAmount ->
-                            change.consume()
-                            val dx = dragAmount.x / max(1, size.width).toFloat()
-                            val dy = dragAmount.y / max(1, size.height).toFloat()
-                            activeRoi = when (dragMode) {
-                                RoiDragMode.RESIZE_TOP -> activeRoi.resizedVertical(
-                                    deltaTop = dy,
-                                    deltaBottom = 0f,
-                                    minHeight = 0.08f,
-                                    maxHeight = 0.36f,
-                                    minTop = 0.16f,
-                                    maxBottom = 0.74f
-                                )
-                                RoiDragMode.RESIZE_BOTTOM -> activeRoi.resizedVertical(
-                                    deltaTop = 0f,
-                                    deltaBottom = dy,
-                                    minHeight = 0.08f,
-                                    maxHeight = 0.36f,
-                                    minTop = 0.16f,
-                                    maxBottom = 0.74f
-                                )
-                                else -> activeRoi.movedBy(
-                                    dx = dx * 0.35f,
-                                    dy = dy,
-                                    minLeft = 0.02f,
-                                    minTop = 0.16f,
-                                    maxRight = 0.98f,
-                                    maxBottom = 0.74f
-                                )
-                            }
-                            latestOnRoiChange(activeRoi)
-                        }
+                    detectRoiGestures(
+                        getLatestRoi = { latestRoi },
+                        onRoiChange = { latestOnRoiChange(it) },
+                        outerTolPx = outerTolPx,
+                        innerVTolMaxPx = innerVTolMaxPx,
+                        innerHTolMaxPx = innerHTolMaxPx,
+                        minLeft = 0.02f,
+                        maxRight = 0.98f,
+                        minTop = 0.16f,
+                        maxBottom = 0.74f,
+                        minHeight = 0.07f,
+                        maxHeight = 0.42f,
+                        minWidth = 0.22f,
+                        maxWidth = 0.96f
                     )
                 }
                 .graphicsLayer {
@@ -655,14 +632,13 @@ internal fun DraggableRoiViewfinderOverlay(
                 cornerRadius = CornerRadius(12.dp.toPx(), 12.dp.toPx()),
                 blendMode = BlendMode.Clear
             )
-            // Bright amber scan frame + corner/edge drag handles
+            // Bright amber scan frame + 4 border handles & corner brackets
             drawRoiFrameWithHandles(
                 left = left,
                 top = top,
                 width = width,
                 height = height,
-                cornerRadiusPx = 12.dp.toPx(),
-                showHorizontalHandles = false
+                cornerRadiusPx = 12.dp.toPx()
             )
         }
 
@@ -686,7 +662,7 @@ internal fun DraggableRoiViewfinderOverlay(
                     modifier = Modifier.size(13.dp)
                 )
                 Text(
-                    text = "Drag up / down",
+                    text = "Move or drag borders",
                     color = Color.Black,
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold
@@ -730,7 +706,7 @@ internal fun GalleryManualCropView(
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("Crop Meter Digits", color = Color.White, style = MaterialTheme.typography.titleMedium)
                 Text(
-                    text = "Drag box up/down over ${unit?.meterType?.label ?: "meter"} digits",
+                    text = "Drag box to move • Drag borders to resize",
                     color = Color.White.copy(alpha = 0.78f),
                     style = MaterialTheme.typography.labelSmall
                 )
@@ -748,7 +724,7 @@ internal fun GalleryManualCropView(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
+                .padding(horizontal = 16.dp, vertical = 10.dp),
             contentAlignment = Alignment.Center
         ) {
             val bitmapAspect = (bitmap.width.toFloat() / max(1, bitmap.height).toFloat()).coerceIn(0.25f, 4f)
@@ -769,81 +745,28 @@ internal fun GalleryManualCropView(
                     modifier = Modifier.fillMaxSize()
                 )
 
-                val edgeTolerancePx = with(density) { 14.dp.toPx() }
+                val outerTolPx = with(density) { 24.dp.toPx() }
+                val innerVTolMaxPx = with(density) { 12.dp.toPx() }
+                val innerHTolMaxPx = with(density) { 16.dp.toPx() }
                 Canvas(
                     modifier = Modifier
                         .fillMaxSize()
                         .testTag("gallery_crop_canvas")
                         .pointerInput(Unit) {
-                            var dragMode = RoiDragMode.MOVE
-                            var activeRoi = latestRoi
-                            detectDragGestures(
-                                onDragStart = { start ->
-                                    activeRoi = latestRoi
-                                    val l = size.width * activeRoi.left
-                                    val t = size.height * activeRoi.top
-                                    val rt = size.width * activeRoi.right
-                                    val b = size.height * activeRoi.bottom
-                                    val vTol = minOf(edgeTolerancePx, (b - t) * 0.22f)
-                                    val hTol = minOf(edgeTolerancePx, (rt - l) * 0.15f)
-                                    val nearH = start.x in (l - hTol)..(rt + hTol)
-                                    val nearV = start.y in (t - vTol)..(b + vTol)
-                                    dragMode = when {
-                                        nearH && abs(start.y - t) <= vTol -> RoiDragMode.RESIZE_TOP
-                                        nearH && abs(start.y - b) <= vTol -> RoiDragMode.RESIZE_BOTTOM
-                                        nearV && abs(start.x - l) <= hTol -> RoiDragMode.RESIZE_LEFT
-                                        nearV && abs(start.x - rt) <= hTol -> RoiDragMode.RESIZE_RIGHT
-                                        else -> RoiDragMode.MOVE
-                                    }
-                                },
-                                onDrag = { change, dragAmount ->
-                                    change.consume()
-                                    val dx = dragAmount.x / max(1, size.width).toFloat()
-                                    val dy = dragAmount.y / max(1, size.height).toFloat()
-                                    activeRoi = when (dragMode) {
-                                        RoiDragMode.RESIZE_TOP -> activeRoi.resizedVertical(
-                                            deltaTop = dy,
-                                            deltaBottom = 0f,
-                                            minHeight = 0.06f,
-                                            maxHeight = 0.70f,
-                                            minTop = 0f,
-                                            maxBottom = 1f
-                                        )
-                                        RoiDragMode.RESIZE_BOTTOM -> activeRoi.resizedVertical(
-                                            deltaTop = 0f,
-                                            deltaBottom = dy,
-                                            minHeight = 0.06f,
-                                            maxHeight = 0.70f,
-                                            minTop = 0f,
-                                            maxBottom = 1f
-                                        )
-                                        RoiDragMode.RESIZE_LEFT -> activeRoi.resizedHorizontal(
-                                            deltaLeft = dx,
-                                            deltaRight = 0f,
-                                            minWidth = 0.18f,
-                                            maxWidth = 0.98f,
-                                            minLeft = 0f,
-                                            maxRight = 1f
-                                        )
-                                        RoiDragMode.RESIZE_RIGHT -> activeRoi.resizedHorizontal(
-                                            deltaLeft = 0f,
-                                            deltaRight = dx,
-                                            minWidth = 0.18f,
-                                            maxWidth = 0.98f,
-                                            minLeft = 0f,
-                                            maxRight = 1f
-                                        )
-                                        RoiDragMode.MOVE -> activeRoi.movedBy(
-                                            dx = dx,
-                                            dy = dy,
-                                            minLeft = 0f,
-                                            minTop = 0f,
-                                            maxRight = 1f,
-                                            maxBottom = 1f
-                                        )
-                                    }
-                                    latestOnRoiChange(activeRoi)
-                                }
+                            detectRoiGestures(
+                                getLatestRoi = { latestRoi },
+                                onRoiChange = { latestOnRoiChange(it) },
+                                outerTolPx = outerTolPx,
+                                innerVTolMaxPx = innerVTolMaxPx,
+                                innerHTolMaxPx = innerHTolMaxPx,
+                                minLeft = 0f,
+                                maxRight = 1f,
+                                minTop = 0f,
+                                maxBottom = 1f,
+                                minHeight = 0.06f,
+                                maxHeight = 0.80f,
+                                minWidth = 0.16f,
+                                maxWidth = 1f
                             )
                         }
                         .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
@@ -864,53 +787,21 @@ internal fun GalleryManualCropView(
                         top = t,
                         width = w,
                         height = h,
-                        cornerRadiusPx = 4.dp.toPx(),
-                        showHorizontalHandles = true
+                        cornerRadiusPx = 4.dp.toPx()
                     )
                 }
             }
         }
 
-        // Height & Width Fine Adjustment Controls
-        Row(
+        Text(
+            text = "Fit ONLY the ${unit?.meterType?.label ?: "meter"} digits inside the box",
+            color = Color.White.copy(alpha = 0.82f),
+            style = MaterialTheme.typography.labelMedium,
+            textAlign = TextAlign.Center,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            OutlinedButton(
-                onClick = { onRoiChange(roi.resizedVertical(deltaTop = 0.02f, deltaBottom = -0.02f)) },
-                contentPadding = PaddingValues(horizontal = 8.dp),
-                modifier = Modifier
-                    .weight(1f)
-                    .testTag("crop_tighter_button")
-            ) {
-                Text("Tighter", color = Color.White, style = MaterialTheme.typography.labelMedium)
-            }
-            OutlinedButton(
-                onClick = { onRoiChange(roi.resizedVertical(deltaTop = -0.02f, deltaBottom = 0.02f)) },
-                contentPadding = PaddingValues(horizontal = 8.dp),
-                modifier = Modifier
-                    .weight(1f)
-                    .testTag("crop_taller_button")
-            ) {
-                Text("Taller", color = Color.White, style = MaterialTheme.typography.labelMedium)
-            }
-            OutlinedButton(
-                onClick = { onRoiChange(roi.resizedHorizontal(deltaLeft = 0.03f, deltaRight = -0.03f, minLeft = 0f, maxRight = 1f)) },
-                contentPadding = PaddingValues(horizontal = 8.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Narrower", color = Color.White, style = MaterialTheme.typography.labelMedium)
-            }
-            OutlinedButton(
-                onClick = { onRoiChange(roi.resizedHorizontal(deltaLeft = -0.03f, deltaRight = 0.03f, minLeft = 0f, maxRight = 1f)) },
-                contentPadding = PaddingValues(horizontal = 8.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Wider", color = Color.White, style = MaterialTheme.typography.labelMedium)
-            }
-        }
+                .padding(horizontal = 16.dp)
+        )
 
         Button(
             onClick = onConfirmCrop,
@@ -934,13 +825,167 @@ internal fun GalleryManualCropView(
     }
 }
 
+private suspend fun PointerInputScope.detectRoiGestures(
+    getLatestRoi: () -> NormalizedRoi,
+    onRoiChange: (NormalizedRoi) -> Unit,
+    outerTolPx: Float,
+    innerVTolMaxPx: Float,
+    innerHTolMaxPx: Float,
+    minLeft: Float,
+    maxRight: Float,
+    minTop: Float,
+    maxBottom: Float,
+    minHeight: Float,
+    maxHeight: Float,
+    minWidth: Float,
+    maxWidth: Float
+) {
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        var activeRoi = getLatestRoi()
+        val dragMode = detectRoiDragMode(
+            start = down.position,
+            widthPx = size.width.toFloat(),
+            heightPx = size.height.toFloat(),
+            roi = activeRoi,
+            outerTolPx = outerTolPx,
+            innerVTolMaxPx = innerVTolMaxPx,
+            innerHTolMaxPx = innerHTolMaxPx
+        )
+        var overSlop = Offset.Zero
+        val dragStart = awaitTouchSlopOrCancellation(down.id) { change, over ->
+            change.consume()
+            overSlop = over
+        }
+        if (dragStart != null) {
+            val w = max(1, size.width).toFloat()
+            val h = max(1, size.height).toFloat()
+            if (overSlop != Offset.Zero) {
+                activeRoi = applyRoiDrag(
+                    current = activeRoi,
+                    mode = dragMode,
+                    dx = overSlop.x / w,
+                    dy = overSlop.y / h,
+                    minLeft = minLeft,
+                    maxRight = maxRight,
+                    minTop = minTop,
+                    maxBottom = maxBottom,
+                    minHeight = minHeight,
+                    maxHeight = maxHeight,
+                    minWidth = minWidth,
+                    maxWidth = maxWidth
+                )
+                onRoiChange(activeRoi)
+            }
+            drag(dragStart.id) { change ->
+                val delta = change.positionChange()
+                change.consume()
+                if (delta != Offset.Zero) {
+                    activeRoi = applyRoiDrag(
+                        current = activeRoi,
+                        mode = dragMode,
+                        dx = delta.x / w,
+                        dy = delta.y / h,
+                        minLeft = minLeft,
+                        maxRight = maxRight,
+                        minTop = minTop,
+                        maxBottom = maxBottom,
+                        minHeight = minHeight,
+                        maxHeight = maxHeight,
+                        minWidth = minWidth,
+                        maxWidth = maxWidth
+                    )
+                    onRoiChange(activeRoi)
+                }
+            }
+        }
+    }
+}
+
+private fun detectRoiDragMode(
+    start: Offset,
+    widthPx: Float,
+    heightPx: Float,
+    roi: NormalizedRoi,
+    outerTolPx: Float,
+    innerVTolMaxPx: Float,
+    innerHTolMaxPx: Float
+): RoiDragMode {
+    val l = widthPx * roi.left
+    val t = heightPx * roi.top
+    val rt = widthPx * roi.right
+    val b = heightPx * roi.bottom
+    val innerVTol = minOf(innerVTolMaxPx, (b - t) * 0.22f)
+    val innerHTol = minOf(innerHTolMaxPx, (rt - l) * 0.18f)
+
+    val nearTop = start.y in (t - outerTolPx)..(t + innerVTol)
+    val nearBottom = start.y in (b - innerVTol)..(b + outerTolPx)
+    val nearLeft = start.x in (l - outerTolPx)..(l + innerHTol)
+    val nearRight = start.x in (rt - innerHTol)..(rt + outerTolPx)
+    val withinH = start.x in (l - outerTolPx)..(rt + outerTolPx)
+    val withinV = start.y in (t - outerTolPx)..(b + outerTolPx)
+
+    return when {
+        nearTop && nearLeft -> RoiDragMode.RESIZE_TOP_LEFT
+        nearTop && nearRight -> RoiDragMode.RESIZE_TOP_RIGHT
+        nearBottom && nearLeft -> RoiDragMode.RESIZE_BOTTOM_LEFT
+        nearBottom && nearRight -> RoiDragMode.RESIZE_BOTTOM_RIGHT
+        nearTop && withinH -> RoiDragMode.RESIZE_TOP
+        nearBottom && withinH -> RoiDragMode.RESIZE_BOTTOM
+        nearLeft && withinV -> RoiDragMode.RESIZE_LEFT
+        nearRight && withinV -> RoiDragMode.RESIZE_RIGHT
+        else -> RoiDragMode.MOVE
+    }
+}
+
+private fun applyRoiDrag(
+    current: NormalizedRoi,
+    mode: RoiDragMode,
+    dx: Float,
+    dy: Float,
+    minLeft: Float,
+    maxRight: Float,
+    minTop: Float,
+    maxBottom: Float,
+    minHeight: Float,
+    maxHeight: Float,
+    minWidth: Float,
+    maxWidth: Float
+): NormalizedRoi {
+    return when (mode) {
+        RoiDragMode.RESIZE_TOP -> current.resizedVertical(dy, 0f, minHeight, maxHeight, minTop, maxBottom)
+        RoiDragMode.RESIZE_BOTTOM -> current.resizedVertical(0f, dy, minHeight, maxHeight, minTop, maxBottom)
+        RoiDragMode.RESIZE_LEFT -> current.resizedHorizontal(dx, 0f, minWidth, maxWidth, minLeft, maxRight)
+        RoiDragMode.RESIZE_RIGHT -> current.resizedHorizontal(0f, dx, minWidth, maxWidth, minLeft, maxRight)
+        RoiDragMode.RESIZE_TOP_LEFT -> current
+            .resizedVertical(dy, 0f, minHeight, maxHeight, minTop, maxBottom)
+            .resizedHorizontal(dx, 0f, minWidth, maxWidth, minLeft, maxRight)
+        RoiDragMode.RESIZE_TOP_RIGHT -> current
+            .resizedVertical(dy, 0f, minHeight, maxHeight, minTop, maxBottom)
+            .resizedHorizontal(0f, dx, minWidth, maxWidth, minLeft, maxRight)
+        RoiDragMode.RESIZE_BOTTOM_LEFT -> current
+            .resizedVertical(0f, dy, minHeight, maxHeight, minTop, maxBottom)
+            .resizedHorizontal(dx, 0f, minWidth, maxWidth, minLeft, maxRight)
+        RoiDragMode.RESIZE_BOTTOM_RIGHT -> current
+            .resizedVertical(0f, dy, minHeight, maxHeight, minTop, maxBottom)
+            .resizedHorizontal(0f, dx, minWidth, maxWidth, minLeft, maxRight)
+        RoiDragMode.MOVE -> current.movedBy(
+            dx = dx,
+            dy = dy,
+            minLeft = minLeft,
+            minTop = minTop,
+            maxRight = maxRight,
+            maxBottom = maxBottom
+        )
+    }
+}
+
 private fun DrawScope.drawRoiFrameWithHandles(
     left: Float,
     top: Float,
     width: Float,
     height: Float,
-    cornerRadiusPx: Float,
-    showHorizontalHandles: Boolean
+    cornerRadiusPx: Float
 ) {
     val amber = Color(0xFFFBBF24)
     val right = left + width
@@ -948,52 +993,35 @@ private fun DrawScope.drawRoiFrameWithHandles(
     val centerX = left + width / 2f
     val centerY = top + height / 2f
 
-    // Subtle crisp amber border
+    // Crisp amber border
     drawRoundRect(
-        color = amber.copy(alpha = 0.9f),
+        color = amber.copy(alpha = 0.92f),
         topLeft = Offset(left, top),
         size = Size(width, height),
         cornerRadius = CornerRadius(cornerRadiusPx, cornerRadiusPx),
         style = Stroke(width = 2.5.dp.toPx())
     )
 
-    // Top & bottom center drag/resize handle bars
+    // Subtle horizontal centerline guide for aligning digits
+    drawLine(
+        color = Color.White.copy(alpha = 0.18f),
+        start = Offset(left + 8.dp.toPx(), centerY),
+        end = Offset(right - 8.dp.toPx(), centerY),
+        strokeWidth = 1.dp.toPx()
+    )
+
+    // White drag/resize handle bars on all 4 borders
     val barHalfW = minOf(22.dp.toPx(), width * 0.18f)
-    val barStroke = 4.dp.toPx()
-    drawLine(
-        color = Color.White,
-        start = Offset(centerX - barHalfW, top),
-        end = Offset(centerX + barHalfW, top),
-        strokeWidth = barStroke,
-        cap = StrokeCap.Round
-    )
-    drawLine(
-        color = Color.White,
-        start = Offset(centerX - barHalfW, bottom),
-        end = Offset(centerX + barHalfW, bottom),
-        strokeWidth = barStroke,
-        cap = StrokeCap.Round
-    )
+    val barHalfH = minOf(16.dp.toPx(), height * 0.28f)
+    val barStroke = 4.5.dp.toPx()
+    // Top & Bottom border handles
+    drawLine(Color.White, Offset(centerX - barHalfW, top), Offset(centerX + barHalfW, top), barStroke, cap = StrokeCap.Round)
+    drawLine(Color.White, Offset(centerX - barHalfW, bottom), Offset(centerX + barHalfW, bottom), barStroke, cap = StrokeCap.Round)
+    // Left & Right border handles
+    drawLine(Color.White, Offset(left, centerY - barHalfH), Offset(left, centerY + barHalfH), barStroke, cap = StrokeCap.Round)
+    drawLine(Color.White, Offset(right, centerY - barHalfH), Offset(right, centerY + barHalfH), barStroke, cap = StrokeCap.Round)
 
-    if (showHorizontalHandles) {
-        val barHalfH = minOf(16.dp.toPx(), height * 0.28f)
-        drawLine(
-            color = Color.White,
-            start = Offset(left, centerY - barHalfH),
-            end = Offset(left, centerY + barHalfH),
-            strokeWidth = barStroke,
-            cap = StrokeCap.Round
-        )
-        drawLine(
-            color = Color.White,
-            start = Offset(right, centerY - barHalfH),
-            end = Offset(right, centerY + barHalfH),
-            strokeWidth = barStroke,
-            cap = StrokeCap.Round
-        )
-    }
-
-    // Subtle corner L-brackets for clear viewfinder alignment
+    // Corner L-brackets for diagonal corner resizing
     val bracketLen = minOf(16.dp.toPx(), width * 0.15f, height * 0.35f)
     val bracketStroke = 3.5.dp.toPx()
     // Top-left

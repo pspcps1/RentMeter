@@ -86,7 +86,8 @@ fun ExpensesScreen(
         amount: Double,
         month: String,
         notes: String,
-        splitMode: ExpenseSplitMode
+        splitMode: ExpenseSplitMode,
+        unitId: Long?
     ) -> Unit,
     onDeleteExpense: (ExpenseEntity) -> Unit
 ) {
@@ -221,10 +222,11 @@ fun ExpensesScreen(
                             val dateStr = SimpleDateFormat("dd MMM yyyy", Locale.US).format(Date(exp.expenseDate))
                             val expShares = chargesByExpense[exp.id].orEmpty()
                             val pendingCount = expShares.count { it.invoiceId == null }
-                            val scopeLabel = if (exp.appliesToAllProperties) {
-                                "All Properties"
-                            } else {
-                                propMap[exp.propertyId]?.name ?: ""
+                            val roomName = exp.unitId?.let { uid -> unitMap[uid]?.unit?.unitName ?: "Room #$uid" }
+                            val scopeLabel = when {
+                                roomName != null -> "$roomName • ${propMap[exp.propertyId]?.name ?: ""}"
+                                exp.appliesToAllProperties -> "All Properties"
+                                else -> propMap[exp.propertyId]?.name ?: ""
                             }
 
                             Surface(
@@ -249,15 +251,34 @@ fun ExpensesScreen(
                                         )
                                         if (exp.splitMode != ExpenseSplitMode.OWNER_ONLY && expShares.isNotEmpty()) {
                                             Spacer(modifier = Modifier.height(4.dp))
+                                            val pillText = if (exp.splitMode == ExpenseSplitMode.SINGLE_ROOM) {
+                                                "Charged to ${roomName ?: "Room"}" +
+                                                    if (pendingCount > 0) " • Pending bill" else " • Billed"
+                                            } else {
+                                                "${exp.splitMode.label} • ${expShares.size} rooms" +
+                                                    if (pendingCount > 0) " ($pendingCount pending bill)" else " (Billed)"
+                                            }
                                             Surface(
                                                 shape = RoundedCornerShape(8.dp),
                                                 color = if (pendingCount > 0) statusColors.partialContainer else statusColors.paidContainer
                                             ) {
                                                 Text(
-                                                    text = "${exp.splitMode.label} • ${expShares.size} rooms" +
-                                                        if (pendingCount > 0) " ($pendingCount pending bill)" else " (Billed)",
+                                                    text = pillText,
                                                     style = MaterialTheme.typography.labelSmall,
                                                     color = if (pendingCount > 0) statusColors.partial else statusColors.paid,
+                                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                                )
+                                            }
+                                        } else if (roomName != null) {
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Surface(
+                                                shape = RoundedCornerShape(8.dp),
+                                                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f)
+                                            ) {
+                                                Text(
+                                                    text = "$roomName • Owner Paid",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
                                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                                                 )
                                             }
@@ -291,26 +312,50 @@ fun ExpensesScreen(
     if (showAddDialog && properties.isNotEmpty()) {
         var appliesToAll by remember { mutableStateOf(filterPropertyId == null && properties.size > 1) }
         var selectedPropId by remember { mutableStateOf(filterPropertyId ?: properties.first().id) }
+        var selectedUnitId by remember { mutableStateOf<Long?>(null) }
         var category by remember { mutableStateOf(ExpenseCategory.WATER_TANKER) }
         var title by remember { mutableStateOf("") }
         var amountText by remember { mutableStateOf("") }
         var notes by remember { mutableStateOf("") }
         var splitMode by remember { mutableStateOf(ExpenseSplitMode.PER_PERSON) }
 
-        val targetOccupied = remember(unitsWithContext, appliesToAll, selectedPropId) {
-            unitsWithContext.filter { ctx ->
-                ctx.activeLease != null && (appliesToAll || ctx.unit.propertyId == selectedPropId)
+        val propertyRooms = remember(unitsWithContext, appliesToAll, selectedPropId) {
+            if (appliesToAll) emptyList()
+            else unitsWithContext.filter { it.unit.propertyId == selectedPropId }
+        }
+        val selectedRoomCtx = remember(unitsWithContext, selectedUnitId) {
+            selectedUnitId?.let { id -> unitsWithContext.find { it.unit.id == id } }
+        }
+
+        val targetOccupied = remember(unitsWithContext, appliesToAll, selectedPropId, selectedRoomCtx) {
+            if (selectedRoomCtx != null) {
+                if (selectedRoomCtx.activeLease != null) listOf(selectedRoomCtx) else emptyList()
+            } else {
+                unitsWithContext.filter { ctx ->
+                    ctx.activeLease != null && (appliesToAll || ctx.unit.propertyId == selectedPropId)
+                }
             }
         }
         val parsedAmount = amountText.toDoubleOrNull() ?: 0.0
         val preview = remember(parsedAmount, splitMode, targetOccupied) {
             RentLedgerRepository.buildSplitPreview(parsedAmount, splitMode, targetOccupied)
         }
-        val canSaveSplit = splitMode == ExpenseSplitMode.OWNER_ONLY || preview.occupiedRooms > 0
+        val availableModes = remember(selectedRoomCtx) {
+            if (selectedRoomCtx != null) {
+                listOf(ExpenseSplitMode.OWNER_ONLY, ExpenseSplitMode.SINGLE_ROOM)
+            } else {
+                listOf(ExpenseSplitMode.OWNER_ONLY, ExpenseSplitMode.EQUAL_PER_ROOM, ExpenseSplitMode.PER_PERSON)
+            }
+        }
+        val canSaveSplit = when {
+            splitMode == ExpenseSplitMode.OWNER_ONLY -> true
+            selectedRoomCtx != null -> selectedRoomCtx.activeLease != null
+            else -> preview.occupiedRooms > 0
+        }
 
         AppFormBottomSheet(
             title = "Add Expense & Split",
-            subtitle = "Track property costs or share water tankers across tenants",
+            subtitle = "Track room/property costs or split across tenants",
             icon = Icons.Default.ReceiptLong,
             onDismiss = { showAddDialog = false },
             confirmText = "Save Expense",
@@ -318,21 +363,23 @@ fun ExpensesScreen(
             confirmTestTag = "save_expense_confirm",
             onConfirm = {
                 val amt = amountText.toDoubleOrNull() ?: return@AppFormBottomSheet
-                val effectivePropId = if (appliesToAll) properties.first().id else selectedPropId
+                val effectivePropId = selectedRoomCtx?.unit?.propertyId
+                    ?: if (appliesToAll) properties.first().id else selectedPropId
                 onAddExpense(
                     effectivePropId,
-                    appliesToAll,
+                    if (selectedRoomCtx != null) false else appliesToAll,
                     category,
                     title.ifBlank { category.label },
                     amt,
                     RentLedgerRepository.currentBillingMonth(),
                     notes,
-                    splitMode
+                    splitMode,
+                    selectedRoomCtx?.unit?.id
                 )
                 showAddDialog = false
             }
         ) {
-            FormSectionCard(title = "Scope & Category") {
+            FormSectionCard(title = "Scope & Room") {
                 Text("Property Scope", style = MaterialTheme.typography.labelMedium)
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -341,7 +388,13 @@ fun ExpensesScreen(
                     if (properties.size > 1) {
                         FilterChip(
                             selected = appliesToAll,
-                            onClick = { appliesToAll = true },
+                            onClick = {
+                                appliesToAll = true
+                                selectedUnitId = null
+                                if (splitMode == ExpenseSplitMode.SINGLE_ROOM) {
+                                    splitMode = ExpenseSplitMode.PER_PERSON
+                                }
+                            },
                             label = { Text("All Properties") }
                         )
                     }
@@ -351,9 +404,50 @@ fun ExpensesScreen(
                             onClick = {
                                 appliesToAll = false
                                 selectedPropId = p.id
+                                if (selectedUnitId != null && unitMap[selectedUnitId]?.unit?.propertyId != p.id) {
+                                    selectedUnitId = null
+                                    if (splitMode == ExpenseSplitMode.SINGLE_ROOM) {
+                                        splitMode = ExpenseSplitMode.OWNER_ONLY
+                                    }
+                                }
                             },
                             label = { Text(p.name) }
                         )
+                    }
+                }
+
+                if (!appliesToAll && propertyRooms.isNotEmpty()) {
+                    Text("Room / Unit (Optional)", style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = selectedUnitId == null,
+                            onClick = {
+                                selectedUnitId = null
+                                if (splitMode == ExpenseSplitMode.SINGLE_ROOM) {
+                                    splitMode = ExpenseSplitMode.OWNER_ONLY
+                                }
+                            },
+                            label = { Text("Whole Property") }
+                        )
+                        propertyRooms.forEach { ctx ->
+                            val occTag = if (ctx.activeLease != null) "" else " (Vacant)"
+                            FilterChip(
+                                selected = selectedUnitId == ctx.unit.id,
+                                onClick = {
+                                    selectedUnitId = ctx.unit.id
+                                    splitMode = if (ctx.activeLease != null && category != ExpenseCategory.PAINTING) {
+                                        ExpenseSplitMode.SINGLE_ROOM
+                                    } else {
+                                        ExpenseSplitMode.OWNER_ONLY
+                                    }
+                                },
+                                label = { Text("${ctx.unit.unitName}$occTag") },
+                                modifier = Modifier.testTag("expense_room_chip_${ctx.unit.id}")
+                            )
+                        }
                     }
                 }
 
@@ -378,7 +472,9 @@ fun ExpensesScreen(
                     onValueChange = { title = it },
                     label = {
                         Text(
-                            if (category == ExpenseCategory.WATER_TANKER) {
+                            if (selectedRoomCtx != null) {
+                                "Description (e.g. ${category.label} for ${selectedRoomCtx.unit.unitName})"
+                            } else if (category == ExpenseCategory.WATER_TANKER) {
                                 "Description (e.g. 5000L Water Tanker)"
                             } else {
                                 "Description (e.g. Tap repair Room 102)"
@@ -413,9 +509,26 @@ fun ExpensesScreen(
                 )
             }
 
-            FormSectionCard(title = "How to Split With Tenants") {
-                ExpenseSplitMode.entries.forEach { mode ->
+            FormSectionCard(
+                title = if (selectedRoomCtx != null) {
+                    "Who Pays (${selectedRoomCtx.unit.unitName})"
+                } else {
+                    "How to Split With Tenants"
+                }
+            ) {
+                availableModes.forEach { mode ->
                     val selected = splitMode == mode
+                    val subtitleText = when {
+                        mode == ExpenseSplitMode.OWNER_ONLY && selectedRoomCtx != null ->
+                            "Owner pays • Tracked under ${selectedRoomCtx.unit.unitName} in reports"
+                        mode == ExpenseSplitMode.SINGLE_ROOM && selectedRoomCtx != null ->
+                            if (selectedRoomCtx.activeLease != null) {
+                                "Collect full amount from ${selectedRoomCtx.activeLease.tenantName} on next bill"
+                            } else {
+                                "Room is vacant — choose Owner Only to log room expense"
+                            }
+                        else -> mode.subtitle
+                    }
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(14.dp),
@@ -448,7 +561,7 @@ fun ExpensesScreen(
                                     fontWeight = FontWeight.SemiBold
                                 )
                                 Text(
-                                    mode.subtitle,
+                                    subtitleText,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -470,7 +583,34 @@ fun ExpensesScreen(
                                 .padding(12.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            if (preview.occupiedRooms == 0) {
+                            if (selectedRoomCtx != null) {
+                                val lease = selectedRoomCtx.activeLease
+                                if (lease == null) {
+                                    Text(
+                                        "${selectedRoomCtx.unit.unitName} is currently vacant. Choose 'Owner Only' to track this cost under the room.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+                                } else {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = "${selectedRoomCtx.unit.unitName} (${lease.tenantName})",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                        Text(
+                                            text = if (parsedAmount > 0) PdfInvoiceGenerator.formatInr(parsedAmount) else "—",
+                                            fontFamily = JetBrainsMonoFamily,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+                            } else if (preview.occupiedRooms == 0) {
                                 Text(
                                     "No active rented rooms in selected scope. Choose 'Owner Only' or check in a tenant first.",
                                     style = MaterialTheme.typography.bodySmall,

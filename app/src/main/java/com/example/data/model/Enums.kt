@@ -52,7 +52,41 @@ enum class WaterRateMode(val label: String) {
 
 @Serializable
 enum class ExpenseSplitMode(val label: String, val subtitle: String) {
-    OWNER_ONLY("Owner Only", "Do not split with tenants"),
+    OWNER_ONLY("Owner Only", "Owner pays (recorded for tracking)"),
+    SINGLE_ROOM("Charge Selected Room", "Collect full amount from this room's tenant"),
     EQUAL_PER_ROOM("Split Per Room", "Equal share for each occupied room"),
     PER_PERSON("Split Per Person", "Share based on persons living in each room")
+}
+
+@Serializable
+enum class TenantGender(val label: String) {
+    UNSPECIFIED("Not Set"),
+    MALE("Male"),
+    FEMALE("Female"),
+    OTHER("Other")
+}
+
+@Serializable
+enum class MaritalStatus(val label: String) {
+    UNSPECIFIED("Not Set"),
+    SINGLE("Single"),
+    MARRIED("Married")
+}
+
+@Serializable
+enum class TenantDocumentType(val label: String) {
+    ID_PROOF("ID Proof"),
+    AGREEMENT("Rent Agreement"),
+    POLICE_VERIFICATION("Police Verification"),
+    OFFICE_ID("Work / College ID"),
+    CHILD_PROOF("Child Proof (<5y)"),
+    OTHER("Other Document")
+}
+
+@Serializable
+enum class ElectricityBillingMode(val label: String, val subtitle: String) {
+    INHERIT("Default", "Use Property or Common default"),
+    METERED("Metered (Sub-meter)", "Scan/enter kWh reading every month"),
+    SEPARATE_CONNECTION("Separate EB Meter", "Tenant pays utility directly (₹0 on rent bill)"),
+    INCLUDED_IN_RENT("Included in Rent", "Electricity included in monthly rent (₹0 extra)")
 }

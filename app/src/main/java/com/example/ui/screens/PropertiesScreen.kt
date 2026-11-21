@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
@@ -30,6 +31,7 @@ import androidx.compose.material.icons.filled.AddHomeWork
 import androidx.compose.material.icons.filled.Apartment
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ChildFriendly
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Group
@@ -71,9 +73,12 @@ import androidx.compose.ui.unit.dp
 import com.example.data.local.LeaseEntity
 import com.example.data.local.PropertyEntity
 import com.example.data.local.UnitEntity
+import com.example.data.model.ElectricityBillingMode
 import com.example.data.model.InvoiceStatus
+import com.example.data.model.MaritalStatus
 import com.example.data.model.MeterType
 import com.example.data.model.PropertyType
+import com.example.data.model.TenantGender
 import com.example.data.model.WaterRateMode
 import com.example.data.preferences.OwnerSettings
 import com.example.data.repository.RentLedgerRepository
@@ -85,6 +90,7 @@ import com.example.ui.components.FormSectionCard
 import com.example.ui.components.InvoiceStatusPill
 import com.example.ui.components.MeterReadingBadge
 import com.example.ui.components.StatusPill
+import com.example.ui.components.TenantAvatar
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.LocalRentStatusColors
 
@@ -104,7 +110,8 @@ fun PropertiesScreen(
         electricityRateOverride: Double?,
         waterMode: WaterRateMode,
         waterRate: Double?,
-        defaultDepositOverride: Double?
+        defaultDepositOverride: Double?,
+        electricityBillingMode: ElectricityBillingMode
     ) -> Unit,
     onDeleteProperty: (PropertyEntity) -> Unit,
     onSaveUnit: (
@@ -120,11 +127,30 @@ fun PropertiesScreen(
         meterType: MeterType,
         analogHasRedDecimal: Boolean,
         lastReading: Double,
-        activeLeaseId: Long?
+        activeLeaseId: Long?,
+        electricityBillingMode: ElectricityBillingMode
     ) -> Unit,
+    onSaveUnitsBulk: (
+        propertyId: Long,
+        unitNames: List<String>,
+        floor: String,
+        baseRent: Double,
+        electricityRateOverride: Double?,
+        waterMode: WaterRateMode,
+        waterRate: Double?,
+        depositOverride: Double?,
+        meterType: MeterType,
+        analogHasRedDecimal: Boolean,
+        startingReading: Double,
+        electricityBillingMode: ElectricityBillingMode
+    ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _, _ -> },
     onDeleteUnit: (UnitEntity) -> Unit,
     onUpdateOccupants: (leaseId: Long, count: Int) -> Unit,
+    onUpdateHousehold: (leaseId: Long, persons: Int, childrenBelow5: Int, childNotes: String) -> Unit = { id, p, _, _ ->
+        onUpdateOccupants(id, p)
+    },
     onUpdateSecurityDeposit: (leaseId: Long, deposit: Double) -> Unit,
+    onOpenTenantProfile: (Long) -> Unit = {},
     onCheckIn: (Long) -> Unit,
     onScanMeter: (Long) -> Unit,
     onOpenBillPreview: (Long) -> Unit,
@@ -135,6 +161,7 @@ fun PropertiesScreen(
     var editingProperty by remember { mutableStateOf<PropertyEntity?>(null) }
     var deletingProperty by remember { mutableStateOf<PropertyEntity?>(null) }
     var showUnitDialogForProp by remember { mutableStateOf<PropertyEntity?>(null) }
+    var unitDialogInitialBulk by remember { mutableStateOf(false) }
     var editingUnit by remember { mutableStateOf<UnitEntity?>(null) }
     var deletingUnit by remember { mutableStateOf<UnitEntity?>(null) }
     var editingOccupantsCtx by remember { mutableStateOf<UnitWithContext?>(null) }
@@ -159,6 +186,17 @@ fun PropertiesScreen(
             TopAppBar(
                 title = { Text("Properties & Rooms", fontWeight = FontWeight.Bold) },
                 actions = {
+                    if (properties.isNotEmpty()) {
+                        TextButton(
+                            onClick = {
+                                unitDialogInitialBulk = true
+                                showUnitDialogForProp = activeProp
+                            },
+                            modifier = Modifier.testTag("bulk_add_rooms_button")
+                        ) {
+                            Text("Bulk Rooms")
+                        }
+                    }
                     TextButton(
                         onClick = { showAddPropertyDialog = true },
                         modifier = Modifier.testTag("add_property_button")
@@ -176,7 +214,10 @@ fun PropertiesScreen(
         floatingActionButton = {
             if (properties.isNotEmpty()) {
                 FloatingActionButton(
-                    onClick = { showUnitDialogForProp = activeProp },
+                    onClick = {
+                        unitDialogInitialBulk = false
+                        showUnitDialogForProp = activeProp
+                    },
                     modifier = Modifier.testTag("add_unit_fab")
                 ) {
                     Icon(Icons.Default.Add, contentDescription = "Add Room or Unit")
@@ -282,8 +323,23 @@ fun PropertiesScreen(
                             Spacer(modifier = Modifier.height(12.dp))
                             Text("No rooms or beds in this property", style = MaterialTheme.typography.titleMedium)
                             Spacer(modifier = Modifier.height(12.dp))
-                            Button(onClick = { showUnitDialogForProp = activeProp }) {
-                                Text("Add Room / Unit")
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Button(
+                                    onClick = {
+                                        unitDialogInitialBulk = false
+                                        showUnitDialogForProp = activeProp
+                                    }
+                                ) {
+                                    Text("Add Room")
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        unitDialogInitialBulk = true
+                                        showUnitDialogForProp = activeProp
+                                    }
+                                ) {
+                                    Text("Bulk Add Rooms")
+                                }
                             }
                         }
                     }
@@ -299,6 +355,7 @@ fun PropertiesScreen(
                                 onDeleteUnit = { deletingUnit = ctx.unit },
                                 onEditOccupants = { editingOccupantsCtx = ctx },
                                 onEditDeposit = { editingDepositCtx = ctx },
+                                onOpenTenantProfile = { leaseId -> onOpenTenantProfile(leaseId) },
                                 onCheckIn = { onCheckIn(ctx.unit.id) },
                                 onScanMeter = { onScanMeter(ctx.unit.id) },
                                 onBillOrPay = {
@@ -319,8 +376,18 @@ fun PropertiesScreen(
         PropertyFormDialog(
             initial = editingProperty,
             settings = settings,
-            onSave = { name, type, address, elecRate, waterMode, waterRate, depositOverride ->
-                onSaveProperty(editingProperty?.id ?: 0L, name, type, address, elecRate, waterMode, waterRate, depositOverride)
+            onSave = { name, type, address, elecRate, waterMode, waterRate, depositOverride, elecMode ->
+                onSaveProperty(
+                    editingProperty?.id ?: 0L,
+                    name,
+                    type,
+                    address,
+                    elecRate,
+                    waterMode,
+                    waterRate,
+                    depositOverride,
+                    elecMode
+                )
                 showAddPropertyDialog = false
                 editingProperty = null
             },
@@ -347,7 +414,8 @@ fun PropertiesScreen(
                 properties = properties,
                 settings = settings,
                 initial = editingUnit,
-                onSave = { propId, name, floor, rent, elecRate, waterMode, waterRate, depositOverride, meterType, redDec, lastRead ->
+                startInBulkMode = editingUnit == null && unitDialogInitialBulk,
+                onSave = { propId, name, floor, rent, elecRate, waterMode, waterRate, depositOverride, meterType, redDec, lastRead, elecMode ->
                     onSaveUnit(
                         editingUnit?.id ?: 0L,
                         propId,
@@ -361,14 +429,35 @@ fun PropertiesScreen(
                         meterType,
                         redDec,
                         lastRead,
-                        editingUnit?.activeLeaseId
+                        editingUnit?.activeLeaseId,
+                        elecMode
                     )
                     showUnitDialogForProp = null
                     editingUnit = null
+                    unitDialogInitialBulk = false
+                },
+                onSaveBulk = { propId, names, floor, rent, elecRate, waterMode, waterRate, depositOverride, meterType, redDec, startRead, elecMode ->
+                    onSaveUnitsBulk(
+                        propId,
+                        names,
+                        floor,
+                        rent,
+                        elecRate,
+                        waterMode,
+                        waterRate,
+                        depositOverride,
+                        meterType,
+                        redDec,
+                        startRead,
+                        elecMode
+                    )
+                    showUnitDialogForProp = null
+                    unitDialogInitialBulk = false
                 },
                 onDismiss = {
                     showUnitDialogForProp = null
                     editingUnit = null
+                    unitDialogInitialBulk = false
                 }
             )
         }
@@ -380,8 +469,8 @@ fun PropertiesScreen(
             OccupantCountDialog(
                 unitName = ctx.unit.unitName,
                 lease = lease,
-                onSave = { count ->
-                    onUpdateOccupants(lease.id, count)
+                onSave = { persons, childrenBelow5, childNotes ->
+                    onUpdateHousehold(lease.id, persons, childrenBelow5, childNotes)
                     editingOccupantsCtx = null
                 },
                 onDismiss = { editingOccupantsCtx = null }
@@ -442,6 +531,7 @@ private fun RoomUnitCard(
     onDeleteUnit: () -> Unit,
     onEditOccupants: () -> Unit,
     onEditDeposit: () -> Unit,
+    onOpenTenantProfile: (Long) -> Unit,
     onCheckIn: () -> Unit,
     onScanMeter: () -> Unit,
     onBillOrPay: () -> Unit,
@@ -509,72 +599,56 @@ private fun RoomUnitCard(
             Spacer(modifier = Modifier.height(10.dp))
 
             if (lease != null) {
+                val demographicsText = buildList {
+                    if (lease.gender != TenantGender.UNSPECIFIED) add(lease.gender.label)
+                    if (lease.maritalStatus != MaritalStatus.UNSPECIFIED) add(lease.maritalStatus.label)
+                }.joinToString(" • ")
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Text(
-                                text = lease.tenantName,
-                                style = MaterialTheme.typography.bodyLarge,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.secondaryContainer,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .clickable(onClick = onEditOccupants)
+                    Row(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { onOpenTenantProfile(lease.id) }
+                            .padding(vertical = 2.dp)
+                            .testTag("tenant_profile_button_${unit.id}"),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        TenantAvatar(
+                            tenantName = lease.tenantName,
+                            photoPath = lease.profilePhotoPath,
+                            size = 40.dp
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Icon(
-                                        Icons.Default.Group,
-                                        contentDescription = "Edit occupants",
-                                        modifier = Modifier.size(13.dp),
-                                        tint = MaterialTheme.colorScheme.onSecondaryContainer
-                                    )
-                                    Text(
-                                        text = "${lease.occupantCount}p",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onSecondaryContainer
-                                    )
-                                }
+                                Text(
+                                    text = lease.tenantName,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Icon(
+                                    Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                    contentDescription = "View tenant profile",
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
                             }
-                        }
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
                             Text(
-                                text = "${lease.tenantPhone} • Due ${lease.rentDueDay}th",
+                                text = buildString {
+                                    append("${lease.tenantPhone} • Due ${lease.rentDueDay}th")
+                                    if (demographicsText.isNotBlank()) append(" • $demographicsText")
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f),
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .clickable(onClick = onEditDeposit)
-                            ) {
-                                Text(
-                                    text = "Dep ${PdfInvoiceGenerator.formatInr(lease.securityDeposit)}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onTertiaryContainer,
-                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
-                                )
-                            }
                         }
                     }
                     Column(horizontalAlignment = Alignment.End) {
@@ -593,6 +667,77 @@ private fun RoomUnitCard(
                         }
                     }
                 }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(onClick = onEditOccupants)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Group,
+                                contentDescription = "Edit occupants",
+                                modifier = Modifier.size(13.dp),
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Text(
+                                text = if (lease.childCountBelow5 > 0) {
+                                    "${lease.occupantCount}p + ${lease.childCountBelow5} <5y"
+                                } else {
+                                    "${lease.occupantCount}p"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
+                    }
+
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(onClick = onEditDeposit)
+                    ) {
+                        Text(
+                            text = "Dep ${PdfInvoiceGenerator.formatInr(lease.securityDeposit)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.75f),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onOpenTenantProfile(lease.id) }
+                    ) {
+                        Text(
+                            text = "Profile & Docs",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                }
             } else {
                 Text(
                     text = "Base Rent: ${PdfInvoiceGenerator.formatInr(unit.baseRent)}/mo • Deposit: ${PdfInvoiceGenerator.formatInr(ctx.effectiveDefaultDeposit)}",
@@ -608,10 +753,22 @@ private fun RoomUnitCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                MeterReadingBadge(reading = unit.lastReading, meterType = unit.meterType)
+                if (ctx.electricityBillingMode == ElectricityBillingMode.METERED) {
+                    MeterReadingBadge(reading = unit.lastReading, meterType = unit.meterType)
+                } else {
+                    StatusPill(
+                        label = ctx.electricityBillingMode.label.uppercase(),
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                }
                 Column(horizontalAlignment = Alignment.End) {
                     Text(
-                        text = "₹${PdfInvoiceGenerator.formatUnits(ctx.effectiveElectricityRate)}/unit (${ctx.electricityRateSource})",
+                        text = when (ctx.electricityBillingMode) {
+                            ElectricityBillingMode.SEPARATE_CONNECTION -> "Electricity: Tenant EB Meter (₹0)"
+                            ElectricityBillingMode.INCLUDED_IN_RENT -> "Electricity: Included in Rent"
+                            else -> "₹${PdfInvoiceGenerator.formatUnits(ctx.effectiveElectricityRate)}/unit (${ctx.electricityRateSource})"
+                        },
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -655,36 +812,56 @@ private fun RoomUnitCard(
                     Text("Check-In Tenant (RentOut)")
                 }
             } else {
+                val isMetered = ctx.electricityBillingMode == ElectricityBillingMode.METERED
+                val hasUnpaid = ctx.latestInvoice?.status != InvoiceStatus.PAID && ctx.latestInvoice != null
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Button(
-                        onClick = onScanMeter,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(44.dp)
-                            .testTag("scan_meter_button_${unit.id}"),
-                        contentPadding = PaddingValues(horizontal = 10.dp)
-                    ) {
-                        Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Scan Meter", maxLines = 1)
-                    }
-                    OutlinedButton(
-                        onClick = onBillOrPay,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(44.dp)
-                            .testTag("bill_button_${unit.id}"),
-                        contentPadding = PaddingValues(horizontal = 10.dp)
-                    ) {
-                        Icon(Icons.Default.Receipt, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = if (ctx.latestInvoice?.status != InvoiceStatus.PAID && ctx.latestInvoice != null) "Pay / PDF" else "Bill",
-                            maxLines = 1
-                        )
+                    if (isMetered) {
+                        Button(
+                            onClick = onScanMeter,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(44.dp)
+                                .testTag("scan_meter_button_${unit.id}"),
+                            contentPadding = PaddingValues(horizontal = 10.dp)
+                        ) {
+                            Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Scan Meter", maxLines = 1)
+                        }
+                        OutlinedButton(
+                            onClick = onBillOrPay,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(44.dp)
+                                .testTag("bill_button_${unit.id}"),
+                            contentPadding = PaddingValues(horizontal = 10.dp)
+                        ) {
+                            Icon(Icons.Default.Receipt, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (hasUnpaid) "Pay / PDF" else "Bill",
+                                maxLines = 1
+                            )
+                        }
+                    } else {
+                        Button(
+                            onClick = onBillOrPay,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(44.dp)
+                                .testTag("bill_button_${unit.id}"),
+                            contentPadding = PaddingValues(horizontal = 10.dp)
+                        ) {
+                            Icon(Icons.Default.Receipt, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (hasUnpaid) "Pay / PDF" else "Generate Bill",
+                                maxLines = 1
+                            )
+                        }
                     }
                     IconButton(
                         onClick = onCheckOut,
@@ -708,20 +885,22 @@ private fun RoomUnitCard(
 private fun OccupantCountDialog(
     unitName: String,
     lease: LeaseEntity,
-    onSave: (Int) -> Unit,
+    onSave: (persons: Int, childrenBelow5: Int, childNotes: String) -> Unit,
     onDismiss: () -> Unit
 ) {
     var count by remember { mutableIntStateOf(lease.occupantCount.coerceAtLeast(1)) }
+    var childrenBelow5 by remember { mutableIntStateOf(lease.childCountBelow5.coerceAtLeast(0)) }
+    var childNotes by remember { mutableStateOf(lease.childNotes) }
     AppFormBottomSheet(
-        title = "Occupants • $unitName",
+        title = "Household • $unitName",
         subtitle = "Tenant: ${lease.tenantName}",
         icon = Icons.Default.Group,
         onDismiss = onDismiss,
-        confirmText = "Save Headcount",
-        onConfirm = { onSave(count) }
+        confirmText = "Save Household",
+        onConfirm = { onSave(count, childrenBelow5, childNotes) }
     ) {
         Text(
-            "Used for per-person water billing and splitting shared expenses (like Water Tankers) by headcount.",
+            "Persons (5+ years & Adults) count toward per-person water charges and tanker splits. Children below 5 years are tracked separately and excluded from per-person billing.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -734,7 +913,7 @@ private fun OccupantCountDialog(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 18.dp),
+                    .padding(horizontal = 20.dp, vertical = 16.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -753,7 +932,7 @@ private fun OccupantCountDialog(
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = if (count == 1) "Person staying" else "Persons staying",
+                        text = if (count == 1) "Person (5+ yrs / Adult)" else "Persons (5+ yrs & Adults)",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -765,6 +944,71 @@ private fun OccupantCountDialog(
                     Icon(Icons.Default.Add, contentDescription = "Increase persons")
                 }
             }
+        }
+
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                FilledTonalIconButton(
+                    onClick = { if (childrenBelow5 > 0) childrenBelow5-- },
+                    enabled = childrenBelow5 > 0,
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Icon(Icons.Default.Remove, contentDescription = "Decrease children below 5")
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.ChildFriendly,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.secondary
+                        )
+                        Text(
+                            text = "$childrenBelow5",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    Text(
+                        text = "Children (< 5 yrs • Not billed)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                FilledTonalIconButton(
+                    onClick = { if (childrenBelow5 < 20) childrenBelow5++ },
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = "Increase children below 5")
+                }
+            }
+        }
+
+        if (childrenBelow5 > 0 || childNotes.isNotBlank()) {
+            OutlinedTextField(
+                value = childNotes,
+                onValueChange = { childNotes = it },
+                label = { Text("Child Name / Age Note (Optional)") },
+                placeholder = { Text("e.g. Vihaan (3 yrs)") },
+                singleLine = true,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
         }
     }
 }
@@ -844,7 +1088,8 @@ private fun PropertyFormDialog(
         electricityRateOverride: Double?,
         waterMode: WaterRateMode,
         waterRate: Double?,
-        defaultDepositOverride: Double?
+        defaultDepositOverride: Double?,
+        electricityBillingMode: ElectricityBillingMode
     ) -> Unit,
     onDelete: (() -> Unit)?,
     onDismiss: () -> Unit
@@ -852,6 +1097,7 @@ private fun PropertyFormDialog(
     var name by remember { mutableStateOf(initial?.name ?: "") }
     var type by remember { mutableStateOf(initial?.type ?: PropertyType.PG) }
     var address by remember { mutableStateOf(initial?.address ?: "") }
+    var elecMode by remember { mutableStateOf(initial?.electricityBillingMode ?: ElectricityBillingMode.INHERIT) }
     var rateText by remember {
         mutableStateOf(initial?.electricityRateOverride?.let { PdfInvoiceGenerator.formatUnits(it) } ?: "")
     }
@@ -863,6 +1109,10 @@ private fun PropertyFormDialog(
         mutableStateOf(initial?.defaultDepositOverride?.let { PdfInvoiceGenerator.formatUnits(it) } ?: "")
     }
 
+    val effectiveElecMode = if (elecMode == ElectricityBillingMode.INHERIT) {
+        settings.defaultElectricityMode
+    } else elecMode
+
     AppFormBottomSheet(
         title = if (initial == null) "Add Property" else "Edit Property",
         subtitle = "Set property details & optional default rates",
@@ -872,12 +1122,16 @@ private fun PropertyFormDialog(
         confirmEnabled = name.isNotBlank(),
         confirmTestTag = "save_property_confirm",
         onConfirm = {
-            val elecOverride = rateText.trim().toDoubleOrNull()?.takeIf { it > 0.0 }
+            val elecOverride = if (effectiveElecMode == ElectricityBillingMode.METERED) {
+                rateText.trim().toDoubleOrNull()?.takeIf { it > 0.0 }
+            } else null
             val waterOverride = if (waterMode == WaterRateMode.PER_ROOM || waterMode == WaterRateMode.PER_PERSON) {
                 waterRateText.trim().toDoubleOrNull()?.takeIf { it >= 0.0 }
             } else null
             val depositOverride = depositText.trim().toDoubleOrNull()?.takeIf { it >= 0.0 }
-            if (name.isNotBlank()) onSave(name, type, address, elecOverride, waterMode, waterOverride, depositOverride)
+            if (name.isNotBlank()) {
+                onSave(name, type, address, elecOverride, waterMode, waterOverride, depositOverride, elecMode)
+            }
         },
         footerExtra = onDelete?.let { deleteAction ->
             {
@@ -929,16 +1183,42 @@ private fun PropertyFormDialog(
         }
 
         FormSectionCard(title = "Property Rate Defaults (Blank = Common Default)") {
-            OutlinedTextField(
-                value = rateText,
-                onValueChange = { rateText = it },
-                label = { Text("Electricity ₹/Unit (Auto ₹${PdfInvoiceGenerator.formatUnits(settings.defaultRatePerUnit)})") },
-                placeholder = { Text("Auto: ₹${PdfInvoiceGenerator.formatUnits(settings.defaultRatePerUnit)}") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                singleLine = true,
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            )
+            Text("Electricity Billing Mode", style = MaterialTheme.typography.labelMedium)
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                ElectricityBillingMode.entries.forEach { mode ->
+                    FilterChip(
+                        selected = elecMode == mode,
+                        onClick = { elecMode = mode },
+                        label = {
+                            val lbl = if (mode == ElectricityBillingMode.INHERIT) {
+                                "Common (${settings.defaultElectricityMode.label})"
+                            } else mode.label
+                            Text(lbl)
+                        }
+                    )
+                }
+            }
+            if (effectiveElecMode == ElectricityBillingMode.METERED) {
+                OutlinedTextField(
+                    value = rateText,
+                    onValueChange = { rateText = it },
+                    label = { Text("Electricity ₹/Unit (Auto ₹${PdfInvoiceGenerator.formatUnits(settings.defaultRatePerUnit)})") },
+                    placeholder = { Text("Auto: ₹${PdfInvoiceGenerator.formatUnits(settings.defaultRatePerUnit)}") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            } else {
+                Text(
+                    text = effectiveElecMode.subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             Text("Property Water Rate", style = MaterialTheme.typography.labelMedium)
             Row(
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -996,6 +1276,7 @@ private fun UnitFormDialog(
     properties: List<PropertyEntity>,
     settings: OwnerSettings,
     initial: UnitEntity?,
+    startInBulkMode: Boolean = false,
     onSave: (
         propertyId: Long,
         unitName: String,
@@ -1007,16 +1288,31 @@ private fun UnitFormDialog(
         depositOverride: Double?,
         meterType: MeterType,
         analogHasRedDecimal: Boolean,
-        lastReading: Double
+        lastReading: Double,
+        electricityBillingMode: ElectricityBillingMode
     ) -> Unit,
+    onSaveBulk: (
+        propertyId: Long,
+        unitNames: List<String>,
+        floor: String,
+        baseRent: Double,
+        electricityRateOverride: Double?,
+        waterMode: WaterRateMode,
+        waterRate: Double?,
+        depositOverride: Double?,
+        meterType: MeterType,
+        analogHasRedDecimal: Boolean,
+        startingReading: Double,
+        electricityBillingMode: ElectricityBillingMode
+    ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _, _ -> },
     onDismiss: () -> Unit
 ) {
     var selectedPropId by remember { mutableStateOf(initial?.propertyId ?: property.id) }
     val selectedProperty = remember(selectedPropId, properties) {
         properties.find { it.id == selectedPropId } ?: property
     }
-    val inheritedElec = remember(selectedProperty, settings) {
-        RentLedgerRepository.resolveElectricityRate(null, selectedProperty, settings)
+    val inheritedElecConfig = remember(selectedProperty, settings) {
+        RentLedgerRepository.resolveElectricityConfig(null, selectedProperty, settings)
     }
     val inheritedWater = remember(selectedProperty, settings) {
         RentLedgerRepository.resolveWaterConfig(null, selectedProperty, 1, settings)
@@ -1025,9 +1321,16 @@ private fun UnitFormDialog(
         RentLedgerRepository.resolveDefaultDeposit(null, selectedProperty, settings)
     }
 
+    var isBulkMode by remember { mutableStateOf(initial == null && startInBulkMode) }
     var unitName by remember { mutableStateOf(initial?.unitName ?: "") }
+    var bulkPrefix by remember { mutableStateOf("Room") }
+    var bulkStartText by remember { mutableStateOf("101") }
+    var bulkEndText by remember { mutableStateOf("110") }
+    var bulkZeroPad by remember { mutableStateOf(false) }
+
     var floor by remember { mutableStateOf(initial?.floorOrWing ?: "") }
     var baseRent by remember { mutableStateOf(initial?.baseRent?.let { PdfInvoiceGenerator.formatUnits(it) } ?: "6500") }
+    var elecMode by remember { mutableStateOf(initial?.electricityBillingMode ?: ElectricityBillingMode.INHERIT) }
     var ratePerUnit by remember {
         mutableStateOf(initial?.electricityRateOverride?.let { PdfInvoiceGenerator.formatUnits(it) } ?: "")
     }
@@ -1042,28 +1345,110 @@ private fun UnitFormDialog(
     var redDecimal by remember { mutableStateOf(initial?.analogHasRedDecimal ?: true) }
     var lastReading by remember { mutableStateOf(initial?.lastReading?.let { PdfInvoiceGenerator.formatUnits(it) } ?: "0") }
 
+    val effectiveElecMode = if (elecMode == ElectricityBillingMode.INHERIT) {
+        inheritedElecConfig.mode
+    } else elecMode
+
+    val previewBulkNames = remember(bulkPrefix, bulkStartText, bulkEndText, bulkZeroPad, isBulkMode) {
+        if (!isBulkMode) emptyList()
+        else {
+            val s = bulkStartText.trim().toIntOrNull()
+            val e = bulkEndText.trim().toIntOrNull()
+            if (s != null && e != null) {
+                RentLedgerRepository.buildBulkUnitNames(
+                    prefix = bulkPrefix,
+                    startNumber = s,
+                    endNumber = e,
+                    zeroPadWidth = if (bulkZeroPad) 3 else 0
+                )
+            } else emptyList()
+        }
+    }
+
+    val confirmEnabled = if (isBulkMode) previewBulkNames.isNotEmpty() else unitName.isNotBlank()
+
     AppFormBottomSheet(
-        title = if (initial == null) "Add Room / Unit / Bed" else "Edit ${initial.unitName}",
+        title = when {
+            initial != null -> "Edit ${initial.unitName}"
+            isBulkMode -> "Bulk Create Rooms / Beds"
+            else -> "Add Room / Unit / Bed"
+        },
         subtitle = selectedProperty.name,
         icon = Icons.Default.MeetingRoom,
         onDismiss = onDismiss,
-        confirmText = "Save Unit",
-        confirmEnabled = unitName.isNotBlank(),
+        confirmText = if (isBulkMode && previewBulkNames.isNotEmpty()) {
+            "Create ${previewBulkNames.size} Rooms"
+        } else {
+            "Save Unit"
+        },
+        confirmEnabled = confirmEnabled,
         confirmTestTag = "save_unit_confirm",
         onConfirm = {
             val rentVal = baseRent.toDoubleOrNull() ?: 0.0
-            val elecOverride = ratePerUnit.trim().toDoubleOrNull()?.takeIf { it > 0.0 }
+            val elecOverride = if (effectiveElecMode == ElectricityBillingMode.METERED) {
+                ratePerUnit.trim().toDoubleOrNull()?.takeIf { it > 0.0 }
+            } else null
             val waterOverride = if (waterMode == WaterRateMode.PER_ROOM || waterMode == WaterRateMode.PER_PERSON) {
                 waterRateText.trim().toDoubleOrNull()?.takeIf { it >= 0.0 }
             } else null
             val depositOverride = depositText.trim().toDoubleOrNull()?.takeIf { it >= 0.0 }
             val readVal = lastReading.toDoubleOrNull() ?: 0.0
-            if (unitName.isNotBlank()) {
-                onSave(selectedPropId, unitName, floor, rentVal, elecOverride, waterMode, waterOverride, depositOverride, meterType, redDecimal, readVal)
+            if (isBulkMode) {
+                if (previewBulkNames.isNotEmpty()) {
+                    onSaveBulk(
+                        selectedPropId,
+                        previewBulkNames,
+                        floor,
+                        rentVal,
+                        elecOverride,
+                        waterMode,
+                        waterOverride,
+                        depositOverride,
+                        meterType,
+                        redDecimal,
+                        readVal,
+                        elecMode
+                    )
+                }
+            } else if (unitName.isNotBlank()) {
+                onSave(
+                    selectedPropId,
+                    unitName,
+                    floor,
+                    rentVal,
+                    elecOverride,
+                    waterMode,
+                    waterOverride,
+                    depositOverride,
+                    meterType,
+                    redDecimal,
+                    readVal,
+                    elecMode
+                )
             }
         }
     ) {
-        FormSectionCard(title = "Room / Unit Details") {
+        if (initial == null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = !isBulkMode,
+                    onClick = { isBulkMode = false },
+                    label = { Text("Single Room") },
+                    modifier = Modifier.weight(1f).testTag("unit_mode_single")
+                )
+                FilterChip(
+                    selected = isBulkMode,
+                    onClick = { isBulkMode = true },
+                    label = { Text("Bulk Rooms (101–110)") },
+                    modifier = Modifier.weight(1f).testTag("unit_mode_bulk")
+                )
+            }
+        }
+
+        FormSectionCard(title = if (isBulkMode) "Room Number Range" else "Room / Unit Details") {
             if (initial == null && properties.size > 1) {
                 Text("Property", style = MaterialTheme.typography.labelMedium)
                 Row(
@@ -1079,16 +1464,71 @@ private fun UnitFormDialog(
                     }
                 }
             }
-            OutlinedTextField(
-                value = unitName,
-                onValueChange = { unitName = it },
-                label = { Text("Room / Bed / Shop Name") },
-                singleLine = true,
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("unit_name_input")
-            )
+
+            if (isBulkMode) {
+                OutlinedTextField(
+                    value = bulkPrefix,
+                    onValueChange = { bulkPrefix = it },
+                    label = { Text("Name Prefix (e.g. Room, Flat, Bed)") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth().testTag("bulk_prefix_input")
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        value = bulkStartText,
+                        onValueChange = { bulkStartText = it },
+                        label = { Text("Start #") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.weight(1f).testTag("bulk_start_input")
+                    )
+                    OutlinedTextField(
+                        value = bulkEndText,
+                        onValueChange = { bulkEndText = it },
+                        label = { Text("End #") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.weight(1f).testTag("bulk_end_input")
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Zero-pad 3 digits (001, 002)", style = MaterialTheme.typography.bodySmall)
+                    Switch(checked = bulkZeroPad, onCheckedChange = { bulkZeroPad = it })
+                }
+                if (previewBulkNames.isNotEmpty()) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                    ) {
+                        Text(
+                            text = "Preview (${previewBulkNames.size} rooms, max 50): " +
+                                if (previewBulkNames.size <= 4) previewBulkNames.joinToString(", ")
+                                else "${previewBulkNames.first()}, ${previewBulkNames[1]} … ${previewBulkNames.last()}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.fillMaxWidth().padding(10.dp)
+                        )
+                    }
+                }
+            } else {
+                OutlinedTextField(
+                    value = unitName,
+                    onValueChange = { unitName = it },
+                    label = { Text("Room / Bed / Shop Name") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("unit_name_input")
+                )
+            }
             OutlinedTextField(
                 value = floor,
                 onValueChange = { floor = it },
@@ -1100,6 +1540,25 @@ private fun UnitFormDialog(
         }
 
         FormSectionCard(title = "Rent, Electricity & Water") {
+            Text("Electricity Option", style = MaterialTheme.typography.labelMedium)
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                ElectricityBillingMode.entries.forEach { mode ->
+                    FilterChip(
+                        selected = elecMode == mode,
+                        onClick = { elecMode = mode },
+                        label = {
+                            val lbl = if (mode == ElectricityBillingMode.INHERIT) {
+                                "Default (${inheritedElecConfig.mode.label})"
+                            } else mode.label
+                            Text(lbl)
+                        }
+                    )
+                }
+            }
+
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
                     value = baseRent,
@@ -1110,22 +1569,24 @@ private fun UnitFormDialog(
                     shape = RoundedCornerShape(14.dp),
                     modifier = Modifier.weight(1f)
                 )
-                OutlinedTextField(
-                    value = ratePerUnit,
-                    onValueChange = { ratePerUnit = it },
-                    label = { Text("₹/Unit (Auto)") },
-                    placeholder = { Text("₹${PdfInvoiceGenerator.formatUnits(inheritedElec.rate)}") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    singleLine = true,
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.weight(1f)
-                )
+                if (effectiveElecMode == ElectricityBillingMode.METERED) {
+                    OutlinedTextField(
+                        value = ratePerUnit,
+                        onValueChange = { ratePerUnit = it },
+                        label = { Text("₹/Unit (Auto)") },
+                        placeholder = { Text("₹${PdfInvoiceGenerator.formatUnits(inheritedElecConfig.rate)}") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
             }
             Text(
-                text = if (ratePerUnit.isBlank()) {
-                    "Using ${inheritedElec.sourceLabel}: ₹${PdfInvoiceGenerator.formatUnits(inheritedElec.rate)}/unit"
-                } else {
-                    "Custom room electricity rate: ₹$ratePerUnit/unit"
+                text = when {
+                    effectiveElecMode != ElectricityBillingMode.METERED -> effectiveElecMode.subtitle
+                    ratePerUnit.isBlank() -> "Using ${inheritedElecConfig.sourceLabel}: ₹${PdfInvoiceGenerator.formatUnits(inheritedElecConfig.rate)}/unit"
+                    else -> "Custom room electricity rate: ₹$ratePerUnit/unit"
                 },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1168,62 +1629,74 @@ private fun UnitFormDialog(
         }
 
         FormSectionCard(title = "Meter & Default Deposit") {
-            Text("Meter Type (Set Once Per Unit)", style = MaterialTheme.typography.labelMedium)
-            MeterType.entries.forEach { m ->
-                val selected = meterType == m
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(14.dp),
-                    color = if (selected) {
-                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f)
-                    } else {
-                        MaterialTheme.colorScheme.surface
-                    },
-                    border = BorderStroke(
-                        width = if (selected) 1.5.dp else 1.dp,
-                        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
-                    ),
-                    onClick = { meterType = m }
-                ) {
-                    Row(
-                        modifier = Modifier.padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+            if (effectiveElecMode == ElectricityBillingMode.METERED) {
+                Text("Meter Type (Set Once Per Unit)", style = MaterialTheme.typography.labelMedium)
+                MeterType.entries.forEach { m ->
+                    val selected = meterType == m
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                        color = if (selected) {
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f)
+                        } else {
+                            MaterialTheme.colorScheme.surface
+                        },
+                        border = BorderStroke(
+                            width = if (selected) 1.5.dp else 1.dp,
+                            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
+                        ),
+                        onClick = { meterType = m }
                     ) {
-                        Icon(
-                            imageVector = if (selected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                            contentDescription = null,
-                            tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(20.dp)
-                        )
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (selected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
+                                contentDescription = null,
+                                tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(m.label, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    m.subtitle,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if (meterType == MeterType.ANALOG_DRUM) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(m.label, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                            Text("Red Decimal Wheel (0.1)?", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                             Text(
-                                m.subtitle,
+                                "Auto-dots last digit (e.g. 097330 → 9733.0)",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
+                        Switch(checked = redDecimal, onCheckedChange = { redDecimal = it })
                     }
                 }
-            }
 
-            if (meterType == MeterType.ANALOG_DRUM) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Red Decimal Wheel (0.1)?", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                        Text(
-                            "Auto-dots last digit (e.g. 097330 → 9733.0)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(checked = redDecimal, onCheckedChange = { redDecimal = it })
-                }
+                OutlinedTextField(
+                    value = lastReading,
+                    onValueChange = { lastReading = it },
+                    label = { Text(if (isBulkMode) "Starting Meter Reading (kWh)" else "Current / Initial Meter Reading (kWh)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
 
             OutlinedTextField(
@@ -1231,16 +1704,6 @@ private fun UnitFormDialog(
                 onValueChange = { depositText = it },
                 label = { Text("Security Deposit ₹ (Auto ₹${PdfInvoiceGenerator.formatUnits(inheritedDeposit.rate)})") },
                 placeholder = { Text("Auto: ₹${PdfInvoiceGenerator.formatUnits(inheritedDeposit.rate)}") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                singleLine = true,
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            OutlinedTextField(
-                value = lastReading,
-                onValueChange = { lastReading = it },
-                label = { Text("Current / Initial Meter Reading (kWh)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 singleLine = true,
                 shape = RoundedCornerShape(14.dp),

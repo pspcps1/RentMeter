@@ -1,5 +1,7 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
@@ -26,16 +28,19 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -61,11 +66,14 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import com.example.data.model.ElectricityBillingMode
 import com.example.data.model.WaterRateMode
 import com.example.data.preferences.AppAccent
 import com.example.data.preferences.OwnerSettings
+import com.example.data.preferences.SettingsDataStore
 import com.example.data.preferences.ThemeMode
 import com.example.engine.PdfInvoiceGenerator
+import com.example.engine.RentReminderManager
 import com.example.ui.components.ConfirmActionDialog
 import com.example.ui.theme.EmeraldPrimary
 import com.example.ui.theme.IndigoPrimary
@@ -87,24 +95,56 @@ fun SettingsScreen(
     var businessName by remember { mutableStateOf(settings.businessName) }
     var upiId by remember { mutableStateOf(settings.ownerUpiId) }
     var ownerPhone by remember { mutableStateOf(settings.ownerPhone) }
+    var defaultElecMode by remember { mutableStateOf(settings.defaultElectricityMode) }
     var defaultRate by remember { mutableStateOf(PdfInvoiceGenerator.formatUnits(settings.defaultRatePerUnit)) }
     var defaultWaterMode by remember { mutableStateOf(settings.defaultWaterMode) }
     var defaultWaterRate by remember { mutableStateOf(PdfInvoiceGenerator.formatUnits(settings.defaultWaterRate)) }
     var defaultDeposit by remember { mutableStateOf(PdfInvoiceGenerator.formatUnits(settings.defaultSecurityDeposit)) }
     var defaultDueDay by remember { mutableStateOf(settings.defaultDueDay.toString()) }
+    var rentGenDay by remember { mutableStateOf(settings.rentGenerationDay) }
+    var customGenDayText by remember {
+        mutableStateOf(if (settings.rentGenerationDay > 0) settings.rentGenerationDay.toString() else "")
+    }
+    var rentReminderEnabled by remember { mutableStateOf(settings.rentReminderEnabled) }
     var showLoadDemoConfirm by remember { mutableStateOf(false) }
     var showResetConfirm by remember { mutableStateOf(false) }
+    var pendingTestReminderAfterPermission by remember { mutableStateOf(false) }
 
     LaunchedEffect(settings) {
         ownerName = settings.ownerName
         businessName = settings.businessName
         upiId = settings.ownerUpiId
         ownerPhone = settings.ownerPhone
+        defaultElecMode = settings.defaultElectricityMode
         defaultRate = PdfInvoiceGenerator.formatUnits(settings.defaultRatePerUnit)
         defaultWaterMode = settings.defaultWaterMode
         defaultWaterRate = PdfInvoiceGenerator.formatUnits(settings.defaultWaterRate)
         defaultDeposit = PdfInvoiceGenerator.formatUnits(settings.defaultSecurityDeposit)
         defaultDueDay = settings.defaultDueDay.toString()
+        rentGenDay = settings.rentGenerationDay
+        customGenDayText = if (settings.rentGenerationDay > 0) settings.rentGenerationDay.toString() else ""
+        rentReminderEnabled = settings.rentReminderEnabled
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            rentReminderEnabled = true
+            viewModel.updateSettings(
+                settings.copy(
+                    rentGenerationDay = rentGenDay,
+                    rentReminderEnabled = true
+                )
+            )
+            if (pendingTestReminderAfterPermission) {
+                pendingTestReminderAfterPermission = false
+                viewModel.sendBillPrepReminderNow()
+            }
+        } else {
+            pendingTestReminderAfterPermission = false
+            viewModel.showMessage("Notification permission denied. Enable notifications in Android Settings.")
+        }
     }
 
     val biometricAvailable = remember(context) {
@@ -254,11 +294,38 @@ fun SettingsScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
 
+                        Text("Default Electricity Mode", style = MaterialTheme.typography.labelMedium)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            listOf(
+                                ElectricityBillingMode.METERED,
+                                ElectricityBillingMode.SEPARATE_CONNECTION,
+                                ElectricityBillingMode.INCLUDED_IN_RENT
+                            ).forEach { mode ->
+                                FilterChip(
+                                    selected = defaultElecMode == mode,
+                                    onClick = { defaultElecMode = mode },
+                                    label = { Text(mode.label) },
+                                    modifier = Modifier.testTag("settings_elec_mode_${mode.name.lowercase()}")
+                                )
+                            }
+                        }
+                        Text(
+                            text = defaultElecMode.subtitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             OutlinedTextField(
                                 value = defaultRate,
                                 onValueChange = { defaultRate = it },
                                 label = { Text("Electricity ₹ / Unit") },
+                                enabled = defaultElecMode == ElectricityBillingMode.METERED,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                                 singleLine = true,
                                 modifier = Modifier.weight(1f).testTag("settings_default_elec_rate")
@@ -331,6 +398,132 @@ fun SettingsScreen(
                     }
                 }
 
+                // Rent Generation Schedule & Owner Reminder Notification
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.CalendarMonth,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                "Rent Generation Date & Reminders",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Text(
+                            "Choose when monthly rent bills should be generated (${SettingsDataStore.formatGenerationDayLabel(rentGenDay)}). On this date, RentLedger reminds you to scan meters & prepare bills.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            listOf(
+                                0 to "Last Day (Default)",
+                                1 to "1st",
+                                5 to "5th",
+                                25 to "25th",
+                                28 to "28th"
+                            ).forEach { (dayVal, label) ->
+                                FilterChip(
+                                    selected = rentGenDay == dayVal,
+                                    onClick = {
+                                        rentGenDay = dayVal
+                                        customGenDayText = if (dayVal > 0) dayVal.toString() else ""
+                                    },
+                                    label = { Text(label) },
+                                    modifier = Modifier.testTag("settings_gen_day_$dayVal")
+                                )
+                            }
+                        }
+
+                        OutlinedTextField(
+                            value = customGenDayText,
+                            onValueChange = { raw ->
+                                customGenDayText = raw
+                                val parsed = raw.trim().toIntOrNull()
+                                rentGenDay = when {
+                                    raw.isBlank() || parsed == 0 -> 0
+                                    parsed != null -> parsed.coerceIn(1, 28)
+                                    else -> rentGenDay
+                                }
+                            },
+                            label = { Text("Custom Day of Month (1–28, blank = Last Day)") },
+                            placeholder = { Text("Last day of month") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().testTag("settings_custom_gen_day")
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                                Text(
+                                    "Owner Bill Prep Notification",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    "Remind me on rent generation day with room list & pending meter scans",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = rentReminderEnabled,
+                                onCheckedChange = { enabled ->
+                                    if (enabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                        !RentReminderManager.hasNotificationPermission(context)
+                                    ) {
+                                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                    } else {
+                                        rentReminderEnabled = enabled
+                                    }
+                                },
+                                modifier = Modifier.testTag("settings_reminder_switch")
+                            )
+                        }
+
+                        FilledTonalButton(
+                            onClick = {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                    !RentReminderManager.hasNotificationPermission(context)
+                                ) {
+                                    pendingTestReminderAfterPermission = true
+                                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                } else {
+                                    viewModel.sendBillPrepReminderNow()
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().height(46.dp).testTag("settings_test_reminder_button")
+                        ) {
+                            Icon(Icons.Default.NotificationsActive, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Send Test Bill Reminder Notification")
+                        }
+                    }
+                }
+
                 // Owner & PDF Invoice Branding
                 Surface(
                     shape = RoundedCornerShape(18.dp),
@@ -383,11 +576,14 @@ fun SettingsScreen(
                                         businessName = businessName.trim().ifBlank { "RentLedger Properties" },
                                         ownerUpiId = upiId.trim(),
                                         ownerPhone = ownerPhone.trim(),
+                                        defaultElectricityMode = defaultElecMode,
                                         defaultRatePerUnit = defaultRate.toDoubleOrNull()?.takeIf { it > 0 } ?: 8.0,
                                         defaultWaterMode = defaultWaterMode,
                                         defaultWaterRate = if (defaultWaterMode == WaterRateMode.NONE) 0.0 else (defaultWaterRate.toDoubleOrNull() ?: 0.0).coerceAtLeast(0.0),
                                         defaultSecurityDeposit = (defaultDeposit.toDoubleOrNull() ?: 10000.0).coerceAtLeast(0.0),
-                                        defaultDueDay = (defaultDueDay.toIntOrNull() ?: 5).coerceIn(1, 28)
+                                        defaultDueDay = (defaultDueDay.toIntOrNull() ?: 5).coerceIn(1, 28),
+                                        rentGenerationDay = rentGenDay.coerceIn(0, 28),
+                                        rentReminderEnabled = rentReminderEnabled
                                     )
                                 )
                             },

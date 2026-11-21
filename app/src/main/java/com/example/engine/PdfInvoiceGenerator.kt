@@ -343,6 +343,135 @@ class PdfInvoiceGenerator(private val context: Context) {
         return outFile
     }
 
+    fun generateTenantReportPdf(
+        lease: LeaseEntity,
+        property: PropertyEntity?,
+        unit: UnitEntity?,
+        invoices: List<InvoiceEntity>,
+        settings: OwnerSettings
+    ): File {
+        val document = PdfDocument()
+        val pageWidth = 595
+        val pageHeight = 842
+        val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, 1).create()
+        val page = document.startPage(pageInfo)
+        val canvas = page.canvas
+
+        val tealColor = Color.rgb(15, 76, 92)
+        val mutedColor = Color.rgb(100, 116, 139)
+        val surfaceTint = Color.rgb(241, 245, 249)
+        val bgPaint = Paint().apply { color = tealColor }
+        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 19f
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        }
+        val subPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(205, 233, 240)
+            textSize = 11f
+        }
+        val sectionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = tealColor
+            textSize = 12f
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        }
+        val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(20, 28, 31)
+            textSize = 11.5f
+        }
+        val boldPaint = Paint(bodyPaint).apply {
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        }
+        val mutedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = mutedColor
+            textSize = 10f
+        }
+        val rightPaint = Paint(bodyPaint).apply { textAlign = Paint.Align.RIGHT }
+        val divider = Paint().apply {
+            color = Color.rgb(226, 232, 240)
+            strokeWidth = 1f
+        }
+
+        canvas.drawRect(0f, 0f, pageWidth.toFloat(), 100f, bgPaint)
+        canvas.drawText("TENANT PROFILE & LEDGER REPORT", 36f, 44f, titlePaint)
+        val propLabel = property?.name ?: "Property"
+        val unitLabel = unit?.unitName ?: "Unit"
+        canvas.drawText(
+            "${settings.businessName.ifBlank { propLabel }} • $unitLabel",
+            36f,
+            68f,
+            subPaint
+        )
+
+        var y = 124f
+        val boxPaint = Paint().apply { color = surfaceTint }
+        canvas.drawRoundRect(RectF(36f, y, 559f, y + 98f), 10f, 10f, boxPaint)
+        canvas.drawText("TENANT DETAILS", 50f, y + 20f, sectionPaint)
+        canvas.drawText("${lease.tenantName} • ${lease.tenantPhone}", 50f, y + 40f, boldPaint)
+        val demoLine = buildString {
+            if (lease.gender.name != "UNSPECIFIED") append("Gender: ${lease.gender.label}  •  ")
+            if (lease.maritalStatus.name != "UNSPECIFIED") append("Status: ${lease.maritalStatus.label}  •  ")
+            append("Persons (5+y): ${lease.occupantCount}")
+            if (lease.childCountBelow5 > 0) append("  •  Children (<5y): ${lease.childCountBelow5}")
+        }
+        canvas.drawText(demoLine, 50f, y + 58f, bodyPaint)
+        val checkInStr = SimpleDateFormat("dd MMM yyyy", Locale.US).format(Date(lease.checkInDate))
+        val idLabel = if (lease.tenantIdNumber.isNotBlank()) "${lease.tenantIdType}: ${lease.tenantIdNumber}" else lease.tenantIdType
+        canvas.drawText("Checked In: $checkInStr  •  $idLabel", 50f, y + 76f, mutedPaint)
+        if (lease.childNotes.isNotBlank()) {
+            canvas.drawText("Child Details (<5y): ${lease.childNotes}", 50f, y + 91f, mutedPaint)
+        }
+
+        y += 120f
+        val totalBilled = invoices.sumOf { it.totalAmount }
+        val totalPaid = invoices.sumOf { it.paidAmount }
+        val totalDue = max(0.0, totalBilled - totalPaid)
+        val totalUnits = invoices.sumOf { it.unitsConsumed }
+
+        canvas.drawText("FINANCIAL SUMMARY", 36f, y, sectionPaint)
+        y += 16f
+        fun summaryRow(label: String, valStr: String) {
+            y += 20f
+            canvas.drawText(label, 36f, y, bodyPaint)
+            canvas.drawText(valStr, 559f, y, rightPaint)
+            y += 8f
+            canvas.drawLine(36f, y, 559f, y, divider)
+        }
+        summaryRow("Total Billed (${invoices.size} invoices)", formatInr(totalBilled))
+        summaryRow("Total Paid", formatInr(totalPaid))
+        summaryRow("Pending Balance Due", formatInr(totalDue))
+        summaryRow("Security Deposit Held", formatInr(lease.securityDeposit))
+        summaryRow("Electricity Consumed", "${formatUnits(totalUnits)} kWh")
+
+        y += 26f
+        canvas.drawText("INVOICE HISTORY", 36f, y, sectionPaint)
+        y += 14f
+        val rows = invoices.sortedByDescending { it.createdAt }.take(12)
+        if (rows.isEmpty()) {
+            y += 20f
+            canvas.drawText("No invoices generated yet.", 36f, y, mutedPaint)
+        } else {
+            rows.forEach { inv ->
+                if (y > pageHeight - 70f) return@forEach
+                y += 20f
+                val mLabel = RentLedgerRepository.formatMonthDisplay(inv.billingMonth)
+                canvas.drawText("${inv.invoiceNumber} ($mLabel) • ${inv.status.label}", 36f, y, bodyPaint)
+                canvas.drawText("${formatInr(inv.paidAmount)} / ${formatInr(inv.totalAmount)}", 559f, y, rightPaint)
+                y += 7f
+                canvas.drawLine(36f, y, 559f, y, divider)
+            }
+        }
+
+        val footerPaint = Paint(mutedPaint).apply { textAlign = Paint.Align.CENTER }
+        canvas.drawText("Generated offline by RentLedger", pageWidth / 2f, pageHeight - 28f, footerPaint)
+
+        document.finishPage(page)
+        val outFile = File(pdfDir, "TENANT_REPORT_${lease.id}_${System.currentTimeMillis()}.pdf")
+        FileOutputStream(outFile).use { document.writeTo(it) }
+        document.close()
+        return outFile
+    }
+
     fun openPdf(file: File): Boolean {
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         val intent = Intent(Intent.ACTION_VIEW).apply {

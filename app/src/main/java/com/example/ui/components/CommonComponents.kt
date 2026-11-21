@@ -1,5 +1,11 @@
 package com.example.ui.components
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -27,11 +33,15 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ElectricMeter
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.BottomSheetDefaults
 import androidx.compose.material3.Button
@@ -47,25 +57,40 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.ContextCompat
+import coil.compose.AsyncImage
 import com.example.data.model.InvoiceStatus
 import com.example.data.model.MeterType
 import com.example.data.repository.UnitWithContext
+import com.example.engine.AppMediaManager
+import com.example.engine.CameraCaptureTarget
+import com.example.engine.ImportedMediaFile
 import com.example.engine.PdfInvoiceGenerator
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.LocalRentStatusColors
+import kotlinx.coroutines.launch
 
 @Composable
 fun StatusPill(
@@ -570,6 +595,232 @@ fun ConfirmActionDialog(
                             .height(48.dp)
                     ) {
                         Text(confirmText, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TenantAvatar(
+    tenantName: String,
+    photoPath: String?,
+    size: Dp = 48.dp,
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+    val resolvedFile = remember(photoPath) { AppMediaManager.resolveStoredFile(context, photoPath) }
+    val initials = remember(tenantName) {
+        tenantName.trim()
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() }
+            .take(2)
+            .mapNotNull { it.firstOrNull()?.uppercaseChar() }
+            .joinToString("")
+            .ifBlank { "T" }
+    }
+    val clickMod = if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier
+
+    Surface(
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.primaryContainer,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)),
+        modifier = modifier
+            .size(size)
+            .clip(CircleShape)
+            .then(clickMod)
+    ) {
+        if (resolvedFile != null) {
+            AsyncImage(
+                model = resolvedFile,
+                contentDescription = "$tenantName profile photo",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    text = initials,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = (size.value * 0.36f).sp,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            }
+        }
+    }
+}
+
+class MediaAttachmentActions(
+    val launchCamera: () -> Unit,
+    val launchGallery: () -> Unit,
+    val launchDocumentPicker: () -> Unit
+)
+
+@Composable
+fun rememberMediaAttachmentActions(
+    folder: String,
+    prefix: String,
+    onAttached: (ImportedMediaFile) -> Unit,
+    onPermissionDenied: () -> Unit = {}
+): MediaAttachmentActions {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val latestOnAttached by rememberUpdatedState(onAttached)
+    val latestOnDenied by rememberUpdatedState(onPermissionDenied)
+    var pendingTarget by remember { mutableStateOf<CameraCaptureTarget?>(null) }
+
+    val takePictureLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture()
+    ) { success ->
+        val target = pendingTarget
+        pendingTarget = null
+        if (target != null) {
+            if (success && target.file.exists() && target.file.length() > 0L) {
+                latestOnAttached(
+                    ImportedMediaFile(
+                        filePath = target.file.absolutePath,
+                        mimeType = "image/jpeg"
+                    )
+                )
+            } else {
+                target.file.delete()
+            }
+        }
+    }
+
+    val startCameraNow = {
+        val target = AppMediaManager.createCameraCaptureTarget(context, folder, prefix)
+        pendingTarget = target
+        takePictureLauncher.launch(target.contentUri)
+    }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            startCameraNow()
+        } else {
+            latestOnDenied()
+        }
+    }
+
+    val galleryLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                AppMediaManager.copyUriToInternalMedia(context, uri, folder, prefix)
+                    ?.let { latestOnAttached(it) }
+            }
+        }
+    }
+
+    val docLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                AppMediaManager.copyUriToInternalMedia(context, uri, folder, prefix)
+                    ?.let { latestOnAttached(it) }
+            }
+        }
+    }
+
+    return remember {
+        MediaAttachmentActions(
+            launchCamera = {
+                val granted = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.CAMERA
+                ) == PackageManager.PERMISSION_GRANTED
+                if (granted) {
+                    startCameraNow()
+                } else {
+                    cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                }
+            },
+            launchGallery = {
+                galleryLauncher.launch(
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                )
+            },
+            launchDocumentPicker = {
+                docLauncher.launch(arrayOf("image/*", "application/pdf"))
+            }
+        )
+    }
+}
+
+@Composable
+fun FullScreenImageDialog(
+    title: String,
+    storedPath: String,
+    onDismiss: () -> Unit,
+    onShareCopy: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+    val resolvedFile = remember(storedPath) { AppMediaManager.resolveStoredFile(context, storedPath) }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = Color.Black
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .navigationBarsPadding()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.Close, contentDescription = "Close preview", tint = Color.White)
+                    }
+                    Text(
+                        text = title,
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                    )
+                    if (onShareCopy != null) {
+                        IconButton(onClick = onShareCopy) {
+                            Icon(Icons.Default.Share, contentDescription = "Save or share copy", tint = Color.White)
+                        }
+                    } else {
+                        Spacer(modifier = Modifier.size(48.dp))
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (resolvedFile != null) {
+                        AsyncImage(
+                            model = resolvedFile,
+                            contentDescription = title,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Text(
+                            text = "File not found in app storage",
+                            color = Color.White.copy(alpha = 0.7f),
+                            style = MaterialTheme.typography.bodyMedium
+                        )
                     }
                 }
             }

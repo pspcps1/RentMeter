@@ -37,6 +37,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -51,6 +52,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.example.data.preferences.ThemeMode
+import com.example.engine.RentReminderManager
 import com.example.ui.components.BiometricLockScreen
 import com.example.ui.navigation.Route
 import com.example.ui.screens.BillPreviewScreen
@@ -61,8 +63,10 @@ import com.example.ui.screens.ExpensesScreen
 import com.example.ui.screens.InvoicePaymentScreen
 import com.example.ui.screens.MeterScannerScreen
 import com.example.ui.screens.PropertiesScreen
+import com.example.ui.screens.RentAgreementScreen
 import com.example.ui.screens.ReportsScreen
 import com.example.ui.screens.SettingsScreen
+import com.example.ui.screens.TenantProfileScreen
 import com.example.ui.theme.RentLedgerTheme
 import com.example.ui.viewmodel.RentLedgerViewModel
 
@@ -152,6 +156,7 @@ private data class TopNavItem(
 
 @Composable
 private fun RentLedgerAppShell(viewModel: RentLedgerViewModel) {
+    val context = LocalContext.current
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -165,6 +170,10 @@ private fun RentLedgerAppShell(viewModel: RentLedgerViewModel) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val selectedPropertyId by viewModel.selectedPropertyId.collectAsStateWithLifecycle()
     val statusBanner by viewModel.statusBanner.collectAsStateWithLifecycle()
+
+    LaunchedEffect(settings.rentReminderEnabled, settings.rentGenerationDay) {
+        RentReminderManager.scheduleDailyReminder(context, settings)
+    }
 
     LaunchedEffect(statusBanner) {
         val msg = statusBanner
@@ -297,16 +306,25 @@ private fun RentLedgerAppShell(viewModel: RentLedgerViewModel) {
                                 selectedPropertyId = selectedPropertyId,
                                 settings = settings,
                                 onSelectProperty = { viewModel.selectProperty(it) },
-                                onSaveProperty = { id, name, type, address, elecRate, waterMode, waterRate, depositOverride ->
-                                    viewModel.saveProperty(id, name, type, address, elecRate, waterMode, waterRate, depositOverride)
+                                onSaveProperty = { id, name, type, address, elecRate, waterMode, waterRate, depositOverride, elecMode ->
+                                    viewModel.saveProperty(id, name, type, address, elecRate, waterMode, waterRate, depositOverride, elecMode)
                                 },
                                 onDeleteProperty = { viewModel.deleteProperty(it) },
-                                onSaveUnit = { id, propId, unitName, floor, rent, elecRate, waterMode, waterRate, depositOverride, meterType, redDec, lastRead, leaseId ->
-                                    viewModel.saveUnit(id, propId, unitName, floor, rent, elecRate, waterMode, waterRate, depositOverride, meterType, redDec, lastRead, leaseId)
+                                onSaveUnit = { id, propId, unitName, floor, rent, elecRate, waterMode, waterRate, depositOverride, meterType, redDec, lastRead, leaseId, elecMode ->
+                                    viewModel.saveUnit(id, propId, unitName, floor, rent, elecRate, waterMode, waterRate, depositOverride, meterType, redDec, lastRead, leaseId, elecMode)
+                                },
+                                onSaveUnitsBulk = { propId, names, floor, rent, elecRate, waterMode, waterRate, depositOverride, meterType, redDec, startRead, elecMode ->
+                                    viewModel.saveUnitsBulk(propId, names, floor, rent, elecRate, waterMode, waterRate, depositOverride, meterType, redDec, startRead, elecMode)
                                 },
                                 onDeleteUnit = { viewModel.deleteUnit(it) },
                                 onUpdateOccupants = { leaseId, count -> viewModel.updateOccupants(leaseId, count) },
+                                onUpdateHousehold = { leaseId, persons, childrenBelow5, childNotes ->
+                                    viewModel.updateHousehold(leaseId, persons, childrenBelow5, childNotes)
+                                },
                                 onUpdateSecurityDeposit = { leaseId, deposit -> viewModel.updateSecurityDeposit(leaseId, deposit) },
+                                onOpenTenantProfile = { leaseId ->
+                                    navController.navigate(Route.TenantProfile(leaseId))
+                                },
                                 onCheckIn = { unitId ->
                                     navController.navigate(Route.CheckIn(unitId))
                                 },
@@ -331,8 +349,8 @@ private fun RentLedgerAppShell(viewModel: RentLedgerViewModel) {
                                 unitsWithContext = unitsWithContext,
                                 expenses = expenses,
                                 sharedCharges = sharedCharges,
-                                onAddExpense = { propId, allProps, cat, title, amt, month, notes, splitMode ->
-                                    viewModel.saveExpense(propId, allProps, cat, title, amt, month, notes, splitMode)
+                                onAddExpense = { propId, allProps, cat, title, amt, month, notes, splitMode, unitId ->
+                                    viewModel.saveExpense(propId, allProps, cat, title, amt, month, notes, splitMode, unitId)
                                 },
                                 onDeleteExpense = { viewModel.deleteExpense(it) }
                             )
@@ -347,6 +365,9 @@ private fun RentLedgerAppShell(viewModel: RentLedgerViewModel) {
                                 leases = leases,
                                 onOpenInvoice = { invoiceId ->
                                     navController.navigate(Route.InvoicePayment(invoiceId))
+                                },
+                                onOpenTenantProfile = { leaseId ->
+                                    navController.navigate(Route.TenantProfile(leaseId))
                                 }
                             )
                         }
@@ -366,7 +387,12 @@ private fun RentLedgerAppShell(viewModel: RentLedgerViewModel) {
                                 defaultDueDay = settings.defaultDueDay,
                                 viewModel = viewModel,
                                 onBack = { navController.popBackStack() },
-                                onCompleted = { navController.popBackStack() }
+                                onCompleted = { navController.popBackStack() },
+                                onCompletedToAgreement = { leaseId ->
+                                    navController.navigate(Route.RentAgreement(leaseId)) {
+                                        popUpTo<Route.CheckIn> { inclusive = true }
+                                    }
+                                }
                             )
                         }
 
@@ -459,6 +485,30 @@ private fun RentLedgerAppShell(viewModel: RentLedgerViewModel) {
                                     navController.navigate(Route.MeterScanner(unitId = args.unitId, forCheckout = true))
                                 },
                                 onFinished = { navController.popBackStack() }
+                            )
+                        }
+
+                        composable<Route.TenantProfile> { entry ->
+                            val args = entry.toRoute<Route.TenantProfile>()
+                            TenantProfileScreen(
+                                leaseId = args.leaseId,
+                                viewModel = viewModel,
+                                onBack = { navController.popBackStack() },
+                                onOpenInvoice = { invoiceId ->
+                                    navController.navigate(Route.InvoicePayment(invoiceId))
+                                },
+                                onCreateAgreement = { leaseId ->
+                                    navController.navigate(Route.RentAgreement(leaseId))
+                                }
+                            )
+                        }
+
+                        composable<Route.RentAgreement> { entry ->
+                            val args = entry.toRoute<Route.RentAgreement>()
+                            RentAgreementScreen(
+                                leaseId = args.leaseId,
+                                viewModel = viewModel,
+                                onBack = { navController.popBackStack() }
                             )
                         }
                     }

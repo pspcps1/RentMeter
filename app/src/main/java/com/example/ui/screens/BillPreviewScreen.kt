@@ -19,6 +19,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ReceiptLong
@@ -60,8 +61,9 @@ import com.example.data.local.LeaseEntity
 import com.example.data.local.PropertyEntity
 import com.example.data.local.SharedChargeEntity
 import com.example.data.local.UnitEntity
+import com.example.data.model.ElectricityBillingMode
 import com.example.data.model.WaterRateMode
-import com.example.data.repository.ResolvedRate
+import com.example.data.repository.ResolvedElectricityConfig
 import com.example.data.repository.ResolvedWaterConfig
 import com.example.engine.MeterReadingParser
 import com.example.engine.PdfInvoiceGenerator
@@ -92,7 +94,9 @@ fun BillPreviewScreen(
     var property by remember { mutableStateOf<PropertyEntity?>(null) }
     var lease by remember { mutableStateOf<LeaseEntity?>(null) }
     var previousDue by remember { mutableStateOf(0.0) }
-    var resolvedElecRate by remember { mutableStateOf(ResolvedRate(8.0, "Common default")) }
+    var resolvedElecConfig by remember {
+        mutableStateOf(ResolvedElectricityConfig(ElectricityBillingMode.METERED, 8.0, "Common default"))
+    }
     var resolvedWater by remember {
         mutableStateOf(ResolvedWaterConfig(WaterRateMode.NONE, 0.0, 1, 0.0, "Common default"))
     }
@@ -113,7 +117,7 @@ fun BillPreviewScreen(
             property = viewModel.repository.getPropertyById(loadedUnit.propertyId)
             val activeLease = viewModel.repository.getActiveLeaseForUnit(unitId)
             lease = activeLease
-            resolvedElecRate = viewModel.repository.getEffectiveElectricityRateForUnit(unitId)
+            resolvedElecConfig = viewModel.repository.getEffectiveElectricityConfigForUnit(unitId)
             val occupants = activeLease?.occupantCount ?: 1
             val waterCfg = viewModel.repository.getResolvedWaterForUnit(unitId, occupants)
             resolvedWater = waterCfg
@@ -124,6 +128,12 @@ fun BillPreviewScreen(
             if (activeLease != null) {
                 previousDue = viewModel.repository.getOutstandingBalanceForLease(activeLease.id)
                 pendingShared = viewModel.repository.getUnbilledSharedChargesForLease(unitId, activeLease.id)
+                if (activeLease.defaultMaintenanceCharge > 0.0) {
+                    maintenanceText = PdfInvoiceGenerator.formatUnits(activeLease.defaultMaintenanceCharge)
+                }
+                if (activeLease.defaultOtherCharge > 0.0) {
+                    otherText = PdfInvoiceGenerator.formatUnits(activeLease.defaultOtherCharge)
+                }
             }
             if (readingText.isBlank()) {
                 readingText = PdfInvoiceGenerator.formatUnits(loadedUnit.lastReading)
@@ -131,19 +141,22 @@ fun BillPreviewScreen(
         }
     }
 
+    val isMetered = resolvedElecConfig.mode == ElectricityBillingMode.METERED
     val prevReading = unit?.lastReading ?: 0.0
     val parsedCurrent = readingText.toDoubleOrNull()
-    val liveWarning = remember(parsedCurrent, prevReading, initialWarningMessage) {
-        if (readingText.isBlank()) {
+    val liveWarning = remember(parsedCurrent, prevReading, initialWarningMessage, isMetered) {
+        if (!isMetered) {
+            null
+        } else if (readingText.isBlank()) {
             initialWarningMessage.ifBlank { "Enter current meter reading." }
         } else {
             MeterReadingParser.validateReading(parsedCurrent, prevReading)
         }
     }
 
-    val unitsConsumed = max(0.0, (parsedCurrent ?: prevReading) - prevReading)
-    val ratePerUnit = resolvedElecRate.rate
-    val electricityCharge = unitsConsumed * ratePerUnit
+    val unitsConsumed = if (isMetered) max(0.0, (parsedCurrent ?: prevReading) - prevReading) else 0.0
+    val ratePerUnit = resolvedElecConfig.rate
+    val electricityCharge = if (isMetered) unitsConsumed * ratePerUnit else 0.0
     val baseRent = unit?.baseRent ?: 0.0
     val waterCharge = waterText.toDoubleOrNull() ?: 0.0
     val maintenanceCharge = maintenanceText.toDoubleOrNull() ?: 0.0
@@ -164,10 +177,12 @@ fun BillPreviewScreen(
                     }
                 },
                 actions = {
-                    TextButton(onClick = onRescan) {
-                        Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Rescan")
+                    if (isMetered) {
+                        TextButton(onClick = onRescan) {
+                            Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Rescan")
+                        }
                     }
                 }
             )
@@ -276,61 +291,95 @@ fun BillPreviewScreen(
                     }
                 }
 
-                Surface(
-                    shape = RoundedCornerShape(16.dp),
-                    color = MaterialTheme.colorScheme.surface,
-                    border = BorderStroke(
-                        width = if (liveWarning != null) 2.dp else 1.dp,
-                        color = if (liveWarning != null) statusColors.partial else MaterialTheme.colorScheme.outlineVariant
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth().padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                if (!isMetered) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
                     ) {
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Text("Previous Reading", style = MaterialTheme.typography.bodyMedium)
-                            Text(
-                                text = "${PdfInvoiceGenerator.formatUnits(prevReading)} kWh",
-                                fontFamily = JetBrainsMonoFamily,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
-                        OutlinedTextField(
-                            value = readingText,
-                            onValueChange = { readingText = it },
-                            label = { Text("Current Meter Reading (kWh)") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                            singleLine = true,
-                            colors = if (liveWarning != null) {
-                                OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = statusColors.partial,
-                                    unfocusedBorderColor = statusColors.partial
+                            Icon(Icons.Default.Bolt, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = resolvedElecConfig.mode.label,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold
                                 )
-                            } else OutlinedTextFieldDefaults.colors(),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .focusRequester(readingFocusRequester)
-                                .testTag("bill_current_reading_input")
-                        )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
+                                Text(
+                                    text = resolvedElecConfig.mode.subtitle,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                             Text(
-                                text = "Units: ${PdfInvoiceGenerator.formatUnits(unitsConsumed)} × ₹${PdfInvoiceGenerator.formatUnits(ratePerUnit)} (${resolvedElecRate.sourceLabel})",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Text(
-                                text = PdfInvoiceGenerator.formatInr(electricityCharge),
+                                text = "₹0",
                                 fontFamily = JetBrainsMonoFamily,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.primary
                             )
+                        }
+                    }
+                } else {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(
+                            width = if (liveWarning != null) 2.dp else 1.dp,
+                            color = if (liveWarning != null) statusColors.partial else MaterialTheme.colorScheme.outlineVariant
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("Previous Reading", style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    text = "${PdfInvoiceGenerator.formatUnits(prevReading)} kWh",
+                                    fontFamily = JetBrainsMonoFamily,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                            OutlinedTextField(
+                                value = readingText,
+                                onValueChange = { readingText = it },
+                                label = { Text("Current Meter Reading (kWh)") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                singleLine = true,
+                                colors = if (liveWarning != null) {
+                                    OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = statusColors.partial,
+                                        unfocusedBorderColor = statusColors.partial
+                                    )
+                                } else OutlinedTextFieldDefaults.colors(),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .focusRequester(readingFocusRequester)
+                                    .testTag("bill_current_reading_input")
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "Units: ${PdfInvoiceGenerator.formatUnits(unitsConsumed)} × ₹${PdfInvoiceGenerator.formatUnits(ratePerUnit)} (${resolvedElecConfig.sourceLabel})",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = PdfInvoiceGenerator.formatInr(electricityCharge),
+                                    fontFamily = JetBrainsMonoFamily,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
                         }
                     }
                 }
@@ -361,18 +410,18 @@ fun BillPreviewScreen(
                     OutlinedTextField(
                         value = maintenanceText,
                         onValueChange = { maintenanceText = it },
-                        label = { Text("Maint/Wi-Fi ₹") },
+                        label = { Text("Maint ₹") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         singleLine = true,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1f).testTag("bill_maintenance_input")
                     )
                     OutlinedTextField(
                         value = otherText,
                         onValueChange = { otherText = it },
-                        label = { Text("Other ₹") },
+                        label = { Text(lease?.defaultOtherChargeLabel?.takeIf { it.isNotBlank() } ?: "Other ₹") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         singleLine = true,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1f).testTag("bill_other_input")
                     )
                 }
 
@@ -486,7 +535,7 @@ fun BillPreviewScreen(
                 } else {
                     Button(
                         onClick = {
-                            val curr = readingText.toDoubleOrNull() ?: return@Button
+                            val curr = if (isMetered) (readingText.toDoubleOrNull() ?: return@Button) else prevReading
                             isSaving = true
                             scope.launch {
                                 val invoiceId = viewModel.repository.createBillAndSaveReading(
@@ -505,7 +554,7 @@ fun BillPreviewScreen(
                                 onInvoiceCreated(invoiceId)
                             }
                         },
-                        enabled = !isSaving && parsedCurrent != null,
+                        enabled = !isSaving && (!isMetered || parsedCurrent != null),
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(52.dp)
@@ -513,7 +562,7 @@ fun BillPreviewScreen(
                     ) {
                         Icon(Icons.Default.ReceiptLong, contentDescription = null)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Save Reading & Generate Invoice")
+                        Text(if (isMetered) "Save Reading & Generate Invoice" else "Generate Monthly Invoice")
                     }
                 }
             }
